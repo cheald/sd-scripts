@@ -4800,7 +4800,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
         noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
     if args.multires_noise_iterations:
         noise = custom_train_functions.pyramid_noise_like(
-            noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
+            noise, latents.device, np.random.randint(3,8), np.random.uniform(0.4, 0.8)
         )
 
     # Sample a random timestep for each image
@@ -4810,6 +4810,9 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 
     timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=latents.device)
     timesteps = timesteps.long()
+
+    latents = latents - latents.mean(dim=(2,3)).view(b_size, -1, 1, 1) * torch.empty((b_size, 4, 1, 1), device=latents.device).uniform_(0.2, 0.9)
+    latents = latents / latents.std(dim=(1,2,3)).clamp(min=1.0).view(b_size, 1, 1, 1)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -5184,7 +5187,7 @@ def sample_image_inference(
     num_suffix = f"e{epoch:06d}" if epoch is not None else f"{steps:06d}"
     seed_suffix = "" if seed is None else f"_{seed}"
     i: int = prompt_dict["enum"]
-    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.png"
+    img_filename = f"{'' if args.output_name is None else args.output_name + '_'}{num_suffix}_{i:02d}_{ts_str}{seed_suffix}.jpg"
     image.save(os.path.join(save_dir, img_filename))
 
     # wandb有効時のみログを送信
