@@ -6,6 +6,7 @@ import sys
 import random
 import time
 import json
+
 from multiprocessing import Value
 import toml
 
@@ -825,7 +826,7 @@ class NetworkTrainer:
                         # print(f"set multiplier: {multipliers}")
                         accelerator.unwrap_model(network).set_multiplier(multipliers)
 
-                    with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
+                    with torch.set_grad_enabled(train_text_encoder and step < args.max_train_text_step), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
                             text_encoder_conds = get_weighted_text_embeddings(
@@ -1094,6 +1095,13 @@ def setup_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="do not use fp16/bf16 VAE in mixed precision (use float VAE) / mixed precisionでも fp16/bf16 VAEを使わずfloat VAEを使う",
     )
+    parser.add_argument(
+        "--max_train_text_step",
+        type=int,
+        default=10000,
+        help="maximum number of steps to train text encoder / Text Encoderを学習する最大ステップ数",
+    )
+
     return parser
 
 
