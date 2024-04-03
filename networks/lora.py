@@ -53,7 +53,10 @@ class LoRAModule(torch.nn.Module):
         #   if self.lora_dim != lora_dim:
         #     logger.info(f"{lora_name} dim (rank) is changed to: {self.lora_dim}")
         # else:
-        self.lora_dim = lora_dim
+
+        self.lora_dim = int(min(in_dim, out_dim) // lora_dim)
+        alpha = alpha / lora_dim * self.lora_dim
+        # print(f"{lora_name} dim (rank) is changed to: {self.lora_dim} alpha: {alpha} (original: {lora_dim})")
 
         if org_module.__class__.__name__ == "Conv2d":
             kernel_size = org_module.kernel_size
