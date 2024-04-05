@@ -457,11 +457,11 @@ def pyramid_noise_like(noise, device, iterations=6, discount=0.4):
     for i in range(iterations):
         r = np.random.uniform(2, 4) # Rather than always going 2x,
         wn, hn = max(1, int(w / (r**i))), max(1, int(h / (r**i)))
-        noise += u(torch.randn(b, c, wn, hn).to(device)) * discount**i
+        noise += u(torch.randn(b, c, wn, hn).to(device)) * (discount**i).view(-1, 4, 1, 1)
         if wn == 1 or hn == 1:
             break  # Lowest resolution is 1x1
-    # return noise / noise.std()  # Scaled back to roughly unit variance
-    return noise / noise.std(dim=(1, 2,3)).view(b, 1, 1, 1)
+    return noise / noise.std()  # Scaled back to roughly unit variance
+    # return noise / noise.std(dim=(1,2,3)).view(b, 1, 1, 1)
 
 
 # https://www.crosslabs.org//blog/diffusion-with-offset-noise

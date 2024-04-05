@@ -4841,20 +4841,39 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
 
     return timesteps, huber_c
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
-    # Sample noise that we'll add to the latents
-    noise = torch.randn_like(latents, device=latents.device)
-    if args.noise_offset:
-        if args.noise_offset_random_strength:
-            noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
-        else:
-            noise_offset = args.noise_offset
-        noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
-    if args.multires_noise_iterations:
-        noise = custom_train_functions.pyramid_noise_like(
-            noise, latents.device, np.random.randint(3,8), np.random.uniform(0.4, 0.8)
-        )
+# These are the mean per-channel observed standard deviations from decoding a large number of images with each VAE
+# SD15_GRAVITY = [0.8768019389510154, 0.9644516724348068, 0.7247742311358452, 0.6673109486401081] # 2000 images from the CelebA dataset
+SD15_GRAVITY = [0.8976874525149663,1.0253903014262518,0.7551555804014206,0.6873028686642647]      # 1500 images from https://github.com/Luehrsen/sd_regularization_images
+SDXL_GRAVITY = [0.9648239882588386, 0.7347126581668854, 0.8247510941624642, 0.6676219371855259]
+SD15_REGUALARIZATION_STATS = [
+  (0.3929519133055583, 0.21744377806049667, 0.8460717107057572, 0.1274036950547156),
+  (-0.5599269200433046, 0.24295370444132255, 0.9705670956969261, 0.15218031406024163),
+  (0.09846222969167866, 0.23753428780697117, 0.7236904840320348, 0.13761903632184447),
+  (0.19408067265362478, 0.2182225712708915, 0.6151259334012866, 0.12918705215009307),
+]
 
+import opensimplex
+def opensimplex_noise(latents, timestamps):
+    # w_coord = torch.arange(0, latents.shape[0], device=latents.device) / 8
+    # z_coord = torch.arange(0, latents.shape[1], device=latents.device) / 8
+    y_coord = torch.arange(0, latents.shape[-2], device="cpu")
+    x_coord = torch.arange(0, latents.shape[-1], device="cpu")
+
+    progress = (1 + (1-(timestamps / 1000)) * 0.4).to("cpu")
+
+    noises = []
+    for i in range(0, latents.shape[0]*latents.shape[1]):
+        opensimplex.seed(np.random.randint(low=np.iinfo(np.int64).min, high=np.iinfo(np.int64).max, size=1)[0])
+        alpha = progress[i//latents.shape[1]]
+        frame = torch.tensor(
+            opensimplex.noise2array((x_coord*alpha).cpu().numpy(), (y_coord*alpha).cpu().numpy()),
+            dtype=torch.float16, device=latents.device)
+        noises.append(frame)
+    noise = torch.stack(noises, dim=0).reshape(latents.shape)
+    return noise / noise.std(dim=(1,2,3)).view(-1, 1, 1, 1)
+
+
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, network):
     # Sample a random timestep for each image
     b_size = latents.shape[0]
     min_timestep = 0 if args.min_timestep is None else args.min_timestep
@@ -4862,8 +4881,125 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 
     timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
-    latents = latents - latents.mean(dim=(2,3)).view(b_size, -1, 1, 1) * torch.empty((b_size, 4, 1, 1), device=latents.device).uniform_(0.2, 0.9)
-    latents = latents / latents.std(dim=(1,2,3)).clamp(min=1.0).view(b_size, 1, 1, 1)
+    # Sample noise that we'll add to the latents
+    noise = torch.randn_like(latents, device=latents.device)
+
+    # field = torch.ones_like(latents, device=latents.device) * np.random.uniform(0.18, 0.6)
+    # noise = noise_scheduler.add_noise(field, noise, timesteps)
+
+    # noise = custom_train_functions.pyramid_noise_like(latents, latents.device, 6, 0.3)
+
+            # indices = torch.argsort(torch.rand_like(latents, device=latents.device), dim=-1)
+            # noise = torch.gather(latents.clone(), dim=-1, index=indices)
+            # # noise = torch.lerp(torch.randn_like(latents, device=latents.device), noise, 0.75)
+
+            # # noise = stack_latent_noise(latents, noise)
+            # # means = torch.tensor([c[0] for c in SD15_REGUALARIZATION_STATS], device=latents.device).view(-1, 4, 1, 1)
+            # # stds = torch.tensor([c[2] for c in SD15_REGUALARIZATION_STATS], device=latents.device).view(-1, 4, 1, 1)
+            # noise = noise - noise.mean(dim=(2,3)).view(-1, 4, 1, 1) # * 0.5 # + means
+    # noise = noise / noise.std(dim=(2,3)).view(-1, 4, 1, 1) # * stds
+
+    # noise = torch.randn_like(latents, device=latents.device)
+    # progress = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps].view(-1, 1, 1, 1)
+
+    # u = torch.nn.Upsample(size=latents.shape[-2:], mode="bilinear").to(latents.device)
+    # noise = u(torch.randn_like(latents, device=latents.device))
+    # # with torch.no_grad():
+    # min_dim = min(noise.shape[-2:])
+    # # factor = 0.2+progress*0.90
+    # for i in range(2, min_dim, 4):
+    #     noise = noise + u(torch.randn(b_size, 4, noise.shape[-2]-i, noise.shape[-1]-i, device=noise.device)) * (1-progress)
+    # noise.div_(noise.std(dim=(1,2,3)).view(-1, 1, 1, 1))
+    # noise = (noise + torch.randn_like(latents, device=latents.device)) / 2
+
+    # noise = opensimplex_noise(latents, timesteps)
+    noise = torch.randn_like(latents, device=latents.device)
+    progress = 1 - noise_scheduler.alphas_cumprod.to(latents.device)[timesteps].view(-1, 1, 1, 1)
+    sm = torch.nn.Sigmoid()
+    if args.multires_noise_discount is not None:
+        # sm = torch.nn.Softmin()
+        pyramid_noise = custom_train_functions.pyramid_noise_like(noise, latents.device, 6, sm(network.noise_discount) * progress)
+        noise = pyramid_noise
+        # learned_progress = progress * network.noise_blend
+        # noise = learned_progress * pyramid_noise + (1 - learned_progress) * noise
+
+        torch.set_printoptions(precision=8)
+        print(network.noise_means, sm(network.noise_discount))
+
+    if args.multires_noise_iterations:
+        if args.adaptive_multires:
+            # progress = (1 - ((timesteps - min_timestep) / (max_timestep - min_timestep))).view(-1, 1, 1, 1)
+            progress = noise_scheduler.alphas_cumprod.to(latents.device)[timesteps].view(-1, 1, 1, 1)
+            # alphas_cumprod = noise_scheduler.alphas_cumprod.to(latents.device)
+            # progress = (alphas_cumprod.sqrt() + (1-alphas_cumprod).sqrt())[timesteps].view(-1, 1, 1, 1)
+            # Approach A: This is simple, just blend the original noise and the pyramid noise
+            pyramid_noise = custom_train_functions.pyramid_noise_like(
+                noise, latents.device,
+                args.multires_noise_iterations,
+                args.multires_noise_discount
+            )
+            noise = progress * pyramid_noise + (1 - progress) * noise
+
+            # Approach B: Produce pyramid noise directly based on the timestep progress
+            for i in range(0, noise.shape[0]):
+                noise[i] = custom_train_functions.pyramid_noise_like(
+                    noise[i].unsqueeze(1), latents.device,
+                    args.multires_noise_iterations,
+                    args.multires_noise_discount + (progress[i] * 0.1)
+                ).squeeze(1)
+        else:
+            noise = custom_train_functions.pyramid_noise_like(
+                noise, latents.device,
+                args.multires_noise_iterations,
+                args.multires_noise_discount
+            )
+
+    if args.noise_offset:
+        if args.noise_offset_random_strength:
+            noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
+        else:
+            noise_offset = args.noise_offset
+        noise = custom_train_functions.apply_noise_offset(latents, noise, noise_offset, args.adaptive_noise_scale)
+
+    # softmax = torch.nn.Softmax()
+    softsign = torch.nn.Softsign()
+    softplus = torch.nn.Softplus()
+    if args.center_latents:
+        latents = latents - (latents.mean(dim=(2,3)) - softsign(network.latent_mean_offset)).view(-1, 4, 1, 1)
+        # This accidental formulation is amazing! Just subtracting a set factor from the latents vastly improves photorealism
+        # latents -= softsign(network.latent_mean_offset).view(-1, 4, 1, 1)
+        #
+        #
+        # softsign(network.latent_mean_offset).view(-1, 4, 1, 1) * latents.mean(dim=(2,3)).view(-1, 4, 1, 1) # torch.randn((b_size, 4, 1, 1), device=latents.device).abs()
+        # latents = latents / latents.std(dim=(2,3)).view(-1, 4, 1, 1) * network.latent_std_factor.view(-1, 4, 1, 1).clamp(min=0.8)
+        #
+
+        print("mean", softsign(network.latent_mean_offset), "\nstd", network.latent_std_factor)
+
+    if False:
+        factor = network.centering_factor # np.random.uniform(0.5, 1.0)
+        STATS = SD15_REGUALARIZATION_STATS
+        min_mean = torch.tensor([c[0] - c[1]*factor for c in STATS], device=latents.device).view(-1, 4, 1, 1)
+        max_mean = torch.tensor([c[0] + c[1]*factor for c in STATS], device=latents.device).view(-1, 4, 1, 1)
+
+        min_std = torch.tensor([c[2] - c[3]*factor for c in STATS], device=latents.device).view(-1, 4, 1, 1)
+        max_std = torch.tensor([c[2] + c[3]*factor for c in STATS], device=latents.device).view(-1, 4, 1, 1)
+
+        tensor_mean = latents.mean(dim=(2,3)).view(-1, 4, 1, 1)
+        tensor_std = latents.std(dim=(2,3)).view(-1, 4, 1, 1)
+        mean_delta = tensor_mean - torch.where(tensor_mean < min_mean, min_mean, torch.where(tensor_mean > max_mean, max_mean, tensor_mean))
+        # init_latents = latents
+        latents = latents.clone().detach()
+        latents = latents - mean_delta
+
+        adj_std = torch.where(tensor_std < min_std, min_std, torch.where(tensor_std > max_std, max_std, tensor_std))
+        latents = latents / latents.std(dim=(2,3)).view(-1, 4, 1, 1) * adj_std
+
+    # centering_factor = torch.empty((b_size, 1, 1, 1), device=latents.device).uniform_(0, 0.7)
+    # gravity = torch.tensor(SDXL_GRAVITY, device=latents.device).repeat(b_size, 1).view(-1, 4, 1, 1)
+    # prior_std = latents.std(dim=(1,2,3)).view(b_size, 1, 1, 1)
+    # latents = latents / prior_std * gravity # ((gravity * centering_factor) + (prior_std * (1 - centering_factor)))
+    # latents = latents - latents.mean(dim=(2,3)).view(b_size, -1, 1, 1) * centering_factor
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -4880,7 +5016,7 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
 
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
 def conditional_loss(model_pred:torch.Tensor, target:torch.Tensor, reduction:str="mean", loss_type:str="l2", huber_c:float=0.1):
-    
+
     if loss_type == 'l2':
         loss = torch.nn.functional.mse_loss(model_pred, target, reduction=reduction)
     elif loss_type == 'huber':

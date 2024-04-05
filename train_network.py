@@ -339,12 +339,36 @@ class NetworkTrainer:
 
         # 後方互換性を確保するよ
         try:
-            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr, args.learning_rate)
+            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr*args.gradient_accumulation_steps, args.unet_lr*args.gradient_accumulation_steps, args.learning_rate*args.gradient_accumulation_steps)
         except TypeError:
             accelerator.print(
                 "Deprecated: use prepare_optimizer_params(text_encoder_lr, unet_lr, learning_rate) instead of prepare_optimizer_params(text_encoder_lr, unet_lr)"
             )
-            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr, args.unet_lr)
+            trainable_params = network.prepare_optimizer_params(args.text_encoder_lr*args.gradient_accumulation_steps, args.unet_lr*args.gradient_accumulation_steps)
+
+        # Hyperparams we're gonna train instead!
+        network.register_parameter("noise_means", torch.nn.Parameter(torch.randn(4, requires_grad=True, device=accelerator.device)))
+        network.register_parameter("latent_mean_offset", torch.nn.Parameter(torch.zeros(4, requires_grad=True, device=accelerator.device)))
+        network.register_parameter("latent_std_factor", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device)))
+        trainable_params.append({"params": [
+            network.get_parameter("noise_means"),
+            network.get_parameter("latent_mean_offset"),
+            network.get_parameter("latent_std_factor"),
+        ], "lr": 5e-2 * args.gradient_accumulation_steps})
+
+        if args.multires_noise_discount is not None:
+            network.register_parameter("noise_discount", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device) * args.multires_noise_discount))
+            network.register_parameter("noise_blend", torch.nn.Parameter(torch.ones(1, requires_grad=True, device=accelerator.device)))
+
+            trainable_params.append({"params": [
+                network.get_parameter("noise_blend"),
+                network.get_parameter("noise_discount")
+            ], "lr": 5e-2 * args.gradient_accumulation_steps})
+
+            # trainable_params.append({"params": [], "lr": 5e-2 * args.gradient_accumulation_steps})
+
+        # network.register_parameter("noise_stds", torch.nn.Parameter(torch.zeros(4, requires_grad=True, device=accelerator.device)))
+        # trainable_params.append({"params": [network.get_parameter("noise_stds")], "lr": 5e-5})
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
@@ -845,7 +869,7 @@ class NetworkTrainer:
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents
+                        args, noise_scheduler, latents, network
                     )
 
                     # ensure the hidden state will require grad
@@ -917,7 +941,8 @@ class NetworkTrainer:
                     progress_bar.update(1)
                     global_step += 1
 
-                    self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
+                    with torch.no_grad():
+                        self.sample_images(accelerator, args, None, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
                     # 指定ステップごとにモデルを保存
                     if args.save_every_n_steps is not None and global_step % args.save_every_n_steps == 0:
@@ -1100,6 +1125,16 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=10000,
         help="maximum number of steps to train text encoder / Text Encoderを学習する最大ステップ数",
+    )
+    parser.add_argument(
+        "--center_latents",
+        action="store_true",
+        help="center latents to correct color and distortion biases",
+    )
+    parser.add_argument(
+        "--adaptive_multires",
+        action="store_true",
+        help="use adaptive multiresolution noise",
     )
 
     return parser
