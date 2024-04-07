@@ -4887,13 +4887,11 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, networ
     # more of the high-end detail gain over time. Maybe use a higher LR with it?
     if args.multires_noise_iterations:
         if args.multires_discount_lr is not None:
+            n = torch.nn.RReLU()
             # Scaling the discount per noise by timestep works well because we want to erase more signal from the noise as we
             # get towards the end of training
             # progress = 1.0 - ((timesteps - min_timestep) / (max_timestep - min_timestep)).view(-1, 1, 1, 1)
-            n = torch.nn.Softplus()
-            progress = 1 - noise_scheduler.alphas_cumprod.to(latents.device)[timesteps].view(-1, 1, 1, 1)
-            print(n(network.noise_discount*progress))
-            discount = n(network.noise_discount.view(1, 4, 1, 1).expand(b_size, 4, 1, 1) * progress)
+            discount = n(network.noise_discount.view(1, 4, 1, 1).expand(b_size, 4, 1, 1))
         else:
             discount = torch.tensor([args.multires_noise_discount], device=latents.device).expand(b_size, 4, 1, 1)
         noise = custom_train_functions.pyramid_noise_like(noise, latents.device, args.multires_noise_iterations, discount)
