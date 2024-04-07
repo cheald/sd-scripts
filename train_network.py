@@ -346,29 +346,27 @@ class NetworkTrainer:
             )
             trainable_params = network.prepare_optimizer_params(args.text_encoder_lr*args.gradient_accumulation_steps, args.unet_lr*args.gradient_accumulation_steps)
 
-        # Hyperparams we're gonna train instead!
-        network.register_parameter("noise_means", torch.nn.Parameter(torch.randn(4, requires_grad=True, device=accelerator.device)))
-        network.register_parameter("latent_mean_offset", torch.nn.Parameter(torch.zeros(4, requires_grad=True, device=accelerator.device)))
-        network.register_parameter("latent_std_factor", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device)))
-        trainable_params.append({"params": [
-            network.get_parameter("noise_means"),
-            network.get_parameter("latent_mean_offset"),
-            network.get_parameter("latent_std_factor"),
-        ], "lr": 5e-2 * args.gradient_accumulation_steps})
+        # Additional hyperparams to learning during training
+        if args.latent_centering_lr is not None:
+            network.register_parameter("latent_mean_offset", torch.nn.Parameter(torch.zeros(4, requires_grad=True, device=accelerator.device)))
+            network.register_parameter("latent_mean_scale", torch.nn.Parameter(torch.ones(1, requires_grad=True, device=accelerator.device)))
+            network.register_parameter("latent_scale", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device)*-4))
+            network.register_parameter("latent_std_sum", torch.nn.Parameter(torch.ones(1, requires_grad=True, device=accelerator.device)*-2))
 
-        if args.multires_noise_discount is not None:
-            network.register_parameter("noise_discount", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device) * args.multires_noise_discount))
-            network.register_parameter("noise_blend", torch.nn.Parameter(torch.ones(1, requires_grad=True, device=accelerator.device)))
 
             trainable_params.append({"params": [
-                network.get_parameter("noise_blend"),
-                network.get_parameter("noise_discount")
-            ], "lr": 5e-2 * args.gradient_accumulation_steps})
+                network.latent_mean_offset,
+                network.latent_mean_scale,
+                network.latent_scale,
+                network.latent_std_sum
+            ], "lr": args.latent_centering_lr * args.gradient_accumulation_steps})
 
-            # trainable_params.append({"params": [], "lr": 5e-2 * args.gradient_accumulation_steps})
+        if args.multires_discount_lr is not None:
+            network.register_parameter("noise_discount", torch.nn.Parameter(torch.ones(4, requires_grad=True, device=accelerator.device) * args.multires_noise_discount))
 
-        # network.register_parameter("noise_stds", torch.nn.Parameter(torch.zeros(4, requires_grad=True, device=accelerator.device)))
-        # trainable_params.append({"params": [network.get_parameter("noise_stds")], "lr": 5e-5})
+            trainable_params.append({"params": [
+                network.get_parameter("noise_discount"),
+            ], "lr": args.multires_discount_lr * args.gradient_accumulation_steps})
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
@@ -435,6 +433,8 @@ class NetworkTrainer:
                 t_enc.to(dtype=te_weight_dtype)
                 # nn.Embedding not support FP8
                 t_enc.text_model.embeddings.to(dtype=(weight_dtype if te_weight_dtype != weight_dtype else te_weight_dtype))
+
+        optimizer.train()
 
         # acceleratorがなんかよろしくやってくれるらしい / accelerator will do something good
         if args.deepspeed:
@@ -916,8 +916,8 @@ class NetworkTrainer:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
-
                     accelerator.backward(loss)
+
                     if accelerator.sync_gradients:
                         self.all_reduce_network(accelerator, network)  # sync DDP grad manually
                         if args.max_grad_norm != 0.0:
@@ -1125,16 +1125,6 @@ def setup_parser() -> argparse.ArgumentParser:
         type=int,
         default=10000,
         help="maximum number of steps to train text encoder / Text Encoderを学習する最大ステップ数",
-    )
-    parser.add_argument(
-        "--center_latents",
-        action="store_true",
-        help="center latents to correct color and distortion biases",
-    )
-    parser.add_argument(
-        "--adaptive_multires",
-        action="store_true",
-        help="use adaptive multiresolution noise",
     )
 
     return parser
