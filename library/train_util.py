@@ -3374,6 +3374,16 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="If set, dynamically learn the value for `multires_noise_discount`. 7e-2..5e-2 is a good starting point",
     )
+    parser.add_argument(
+        "--sigma_uncertainty_model",
+        type=str,
+        default=None,
+    )
+    parser.add_argument(
+        "--train_sigma_uncertainty",
+        action="store_true",
+        help="Train sigma uncertainty"
+    )
 
     if support_dreambooth:
         # DreamBooth training

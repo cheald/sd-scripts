@@ -14,6 +14,7 @@ from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
+from library.timestep_uncertainty import TimestepUncertaintyLossNetwork
 
 init_ipex()
 
@@ -367,6 +368,16 @@ class NetworkTrainer:
             trainable_params.append({"params": [
                 network.get_parameter("noise_discount"),
             ], "lr": args.multires_discount_lr * args.gradient_accumulation_steps})
+
+        if args.sigma_uncertainty_model:
+            timestep_uncertainty_loss = TimestepUncertaintyLossNetwork().to(accelerator.device)
+            timestep_uncertainty_loss.load_weights(args.sigma_uncertainty_model)
+            if args.train_sigma_uncertainty:
+                timestep_uncertainty_loss.train()
+                # important that you don't have weight decay here, this model has forced weight norm and its weights will not grow in magnitude - drhead
+                trainable_params.append({"params": timestep_uncertainty_loss.parameters(), "lr": 1e-3, "weight_decay": 0.0})
+            else:
+                timestep_uncertainty_loss.eval()
 
         optimizer_name, optimizer_args, optimizer = train_util.get_optimizer(args, trainable_params)
 
@@ -812,6 +823,8 @@ class NetworkTrainer:
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
+        sigmas = ((1 - noise_scheduler.alphas_cumprod) / noise_scheduler.alphas_cumprod).sqrt().to(accelerator.device)
+
         # training loop
         for epoch in range(num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -915,6 +928,9 @@ class NetworkTrainer:
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
+                    if args.sigma_uncertainty_model:
+                        loss = timestep_uncertainty_loss.loss(sigmas[timesteps], loss)
+
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
                     accelerator.backward(loss)
 
@@ -987,6 +1003,9 @@ class NetworkTrainer:
                 if is_main_process and saving:
                     ckpt_name = train_util.get_epoch_ckpt_name(args, "." + args.save_model_as, epoch + 1)
                     save_model(ckpt_name, accelerator.unwrap_model(network), global_step, epoch + 1)
+
+                    if args.train_sigma_uncertainty:
+                        accelerator.unwrap_model(timestep_uncertainty_loss).save_weights(args.sigma_uncertainty_model)
 
                     remove_epoch_no = train_util.get_remove_epoch_no(args, epoch + 1)
                     if remove_epoch_no is not None:
