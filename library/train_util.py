@@ -3357,6 +3357,12 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="tags for model metadata, separated by comma / メタデータに書き込まれるモデルタグ、カンマ区切り",
     )
+    parser.add_argument(
+        "--std_loss_weight",
+        type=float,
+        default=None,
+        help="Weight for standard deviation loss. Encourages the model to learn noise with a stddev like the true noise. May prevent 'deep fry'. 1.0 is a good starting place.",
+    )
 
     if support_dreambooth:
         # DreamBooth training
@@ -4929,6 +4935,15 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     return noise, noisy_latents, timesteps, huber_c
+
+
+def noise_stats(noise):
+    diff     = noise - noise.mean(dim=(1,2,3), keepdim=True)
+    std      = noise.std(dim=(1,2,3))
+    zscores  = diff / std[:, None, None, None]
+    skews    = (zscores**3).mean(dim=(1,2,3))
+    kurtoses = (zscores**4).mean(dim=(1,2,3)) - 3.0
+    return std, skews, kurtoses
 
 
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
