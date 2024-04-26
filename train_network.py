@@ -8,6 +8,8 @@ import time
 import json
 from multiprocessing import Value
 import toml
+import numpy as np
+import torch.nn.functional as F
 
 from tqdm import tqdm
 
@@ -53,9 +55,9 @@ class NetworkTrainer:
 
     # TODO 他のスクリプトと共通化する
     def generate_step_logs(
-        self, args: argparse.Namespace, current_loss, avr_loss, lr_scheduler, keys_scaled=None, mean_norm=None, maximum_norm=None
+        self, args: argparse.Namespace, current_loss, avr_loss, lr_scheduler, keys_scaled=None, mean_norm=None, maximum_norm=None, extra={}
     ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
+        logs = {"loss/current": current_loss, "loss/average": avr_loss, **extra}
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -814,6 +816,7 @@ class NetworkTrainer:
             accelerator.unwrap_model(network).on_epoch_start(text_encoder, unet)
 
             for step, batch in enumerate(train_dataloader):
+                step_logs = {}
                 optimizer_train_if_needed()
                 current_step.value = global_step
                 with accelerator.accumulate(training_model):
@@ -894,8 +897,12 @@ class NetworkTrainer:
                     loss = train_util.conditional_loss(
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
-                    if args.masked_loss:
-                        loss = apply_masked_loss(loss, batch)
+
+                    if args.masked_loss and np.random.rand() < args.masked_loss_prob:
+                        loss, noise_mask = apply_masked_loss(loss, batch)
+                    else:
+                        noise_mask = torch.ones_like(noise, device=noise.device)
+
                     loss = loss.mean([1, 2, 3])
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
@@ -909,6 +916,19 @@ class NetworkTrainer:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
+
+                    pred_std, pred_skews, pred_kurtoses = train_util.noise_stats(noise_pred * noise_mask)
+                    true_std, true_skews, true_kurtoses = train_util.noise_stats(noise * noise_mask)
+
+                    if args.std_loss_weight is not None:
+                        std_loss = F.mse_loss(pred_std, true_std, reduction="none")
+                        loss = loss + std_loss * args.std_loss_weight
+
+                    step_logs["metrics/noise_pred_std"]      = pred_std.mean().item()
+                    step_logs["metrics/noise_pred_mean"]     = noise_pred.mean()
+                    step_logs["metrics/std_divergence"]      = true_std.mean().item()      - pred_std.mean().item()
+                    step_logs["metrics/skew_divergence"]     = true_skews.mean().item()    - pred_skews.mean().item()
+                    step_logs["metrics/kurtosis_divergence"] = true_kurtoses.mean().item() - pred_kurtoses.mean().item()
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
@@ -965,7 +985,7 @@ class NetworkTrainer:
                     progress_bar.set_postfix(**{**max_mean_logs, **logs})
 
                 if args.logging_dir is not None:
-                    logs = self.generate_step_logs(args, current_loss, avr_loss, lr_scheduler, keys_scaled, mean_norm, maximum_norm)
+                    logs = self.generate_step_logs(args, current_loss, avr_loss, lr_scheduler, keys_scaled, mean_norm, maximum_norm, step_logs)
                     accelerator.log(logs, step=global_step)
 
                 if global_step >= args.max_train_steps:
