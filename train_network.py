@@ -796,6 +796,7 @@ class NetworkTrainer:
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
         # training loop
         for epoch in range(num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -883,16 +884,18 @@ class NetworkTrainer:
                     else:
                         target = noise
 
-                    loss = train_util.conditional_loss(
-                        noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
-                    )
+                    mae_loss = F.l1_loss(noise_pred, target, reduction="none")
+                    mse_loss = F.mse_loss(noise_pred, target, reduction="none")
+                    base_loss = 1/-mse_loss.exp() + 1
+
+                    ac = alphas_cumprod[timesteps]
+                    loss = base_loss.mean(dim=(2, 3), keepdims=True) * ac.sqrt()
+                    loss = loss + base_loss.std(dim=(2,3), keepdims=True) * (1-ac).sqrt()
 
                     if args.masked_loss and np.random.rand() < args.masked_loss_prob:
-                        loss, noise_mask = apply_masked_loss(loss, batch)
-                    else:
-                        noise_mask = torch.ones_like(noise, device=noise.device)
+                        loss = apply_masked_loss(loss, batch)
 
-                    loss = loss.mean([1, 2, 3])
+                    loss = loss.mean(dim=(1,2,3))
 
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
@@ -906,18 +909,6 @@ class NetworkTrainer:
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
-                    pred_std, pred_skews, pred_kurtoses = train_util.noise_stats(noise_pred * noise_mask)
-                    true_std, true_skews, true_kurtoses = train_util.noise_stats(noise * noise_mask)
-
-                    if args.std_loss_weight is not None:
-                        std_loss = F.mse_loss(pred_std, true_std, reduction="none")
-                        loss = loss + std_loss * args.std_loss_weight
-
-                    step_logs["metrics/noise_pred_std"]      = pred_std.mean().item()
-                    step_logs["metrics/noise_pred_mean"]     = noise_pred.mean()
-                    step_logs["metrics/std_divergence"]      = true_std.mean().item()      - pred_std.mean().item()
-                    step_logs["metrics/skew_divergence"]     = true_skews.mean().item()    - pred_skews.mean().item()
-                    step_logs["metrics/kurtosis_divergence"] = true_kurtoses.mean().item() - pred_kurtoses.mean().item()
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
