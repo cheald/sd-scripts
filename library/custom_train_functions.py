@@ -486,7 +486,7 @@ def apply_masked_loss(loss, batch):
     # resize to the same size as the loss
     mask_image = torch.nn.functional.interpolate(mask_image, size=loss.shape[2:], mode="area")
     mask_image = mask_image / 2 + 0.5
-    loss = loss * (mask_image + (1-mask_image) * torch.rand_like(mask_image))
+    loss = loss * mask_image # + (1-mask_image) * torch.rand_like(mask_image))
     return loss
 
 
