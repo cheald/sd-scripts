@@ -33,6 +33,7 @@ import library.huggingface_util as huggingface_util
 import library.custom_train_functions as custom_train_functions
 from library.custom_train_functions import (
     apply_snr_weight,
+    get_mask,
     get_weighted_text_embeddings,
     prepare_scheduler_for_custom_training,
     scale_v_prediction_loss_like_noise_prediction,
@@ -46,6 +47,9 @@ setup_logging()
 import logging
 
 logger = logging.getLogger(__name__)
+
+from safetensors import safe_open
+
 
 
 class NetworkTrainer:
@@ -806,7 +810,9 @@ class NetworkTrainer:
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
+        noise_stds = safe_open("noise_std.safetensors", framework="pt").get_tensor("stds").to(accelerator.device)
         alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
+
         # training loop
         for epoch in range(num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -895,16 +901,77 @@ class NetworkTrainer:
                     else:
                         target = noise
 
-                    mae_loss = F.l1_loss(noise_pred, target, reduction="none")
-                    mse_loss = F.mse_loss(noise_pred, target, reduction="none")
-                    base_loss = 1/-mse_loss.exp() + 1
+                    # loss = train_util.conditional_loss(
+                    #     noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
+                    # )
 
-                    ac = alphas_cumprod[timesteps]
-                    loss = base_loss.mean(dim=(2, 3), keepdims=True) * ac.sqrt()
-                    loss = loss + base_loss.std(dim=(2,3), keepdims=True) * (1-ac).sqrt()
+                    mask = get_mask(batch, noisy_latents)
+                    noise_pred.register_hook(lambda grad: grad * mask)
+                    std_loss = F.l1_loss(
+                                    noise_pred.std(dim=(2,3), keepdims=True),
+                                    target.to(dtype=noise_pred.dtype).std(dim=(2,3), keepdims=True),
+                                    reduction="none")
+                    # print( target.to(dtype=noise_pred.dtype).std(dim=(2,3)) )
+                    mse_loss = F.mse_loss(noise_pred, target.to(dtype=noise_pred.dtype), reduction="none")
 
-                    if args.masked_loss and np.random.rand() < args.masked_loss_prob:
-                        loss = apply_masked_loss(loss, batch)
+
+                    # huber_loss = F.huber_loss(noise_pred, target, delta=1.0, reduction="none")
+
+                    # step_logs["loss/mse_loss"] = mse_loss.mean().item()
+                    # step_logs["loss/mae_loss"] = mae_loss.mean().item()
+                    # step_logs["loss/pseudo_huber_loss"] = huber_loss.mean().item()
+
+                    ########################################################################################################
+                    #### mae + 1+mse(noise, 0) starts flat but adds detail SLOWLY
+                    #### mse_loss / x is interesting
+                    #### mse_loss / (mse_loss-1).exp() is interesting. Starts slow but develops EXCEPTIONAL photorealism.
+                    ########################################################################################################
+
+                    # loss = mse_loss # * (1+F.mse_loss(noise, torch.zeros_like(noise), reduction="none"))
+                    # loss = F.sigmoid(mae_loss)
+                    # base_loss = mse_loss / (mse_loss-1).exp()
+                    # loss = mse_loss
+                    # base_loss = 1/-mse_loss.exp() + 1
+                    base_loss = mse_loss
+
+                    step_logs["metrics/loss_variance"] = base_loss.std(dim=(2,3)).mean().item()
+
+                    ac = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+                    # acq1 = ac.sqrt()
+                    # acq2 = (1-ac).sqrt()
+                    # acq3 = (1-ac) ** 0.125
+                    # channel_weights = torch.tensor([0.7413, 0.0000, 1.0000, 0.9385], device=ac.device).expand(ac.size(0), 4).view(-1, 4, 1, 1) * 0.5 + 0.5
+                    channel_weights = torch.rand((ac.size(0), 4, 1, 1), device=ac.device)#  * 2.0
+                    # acq = acq2
+                    ones = torch.ones_like(ac)
+                    loss = base_loss.mean(dim=(2, 3), keepdims=True) # * ac.sqrt()
+                    # (loss + std_loss * 0.25) / (1+std_loss) -- this works very well, but doesn't preserve quite enough detail
+                    # loss = loss / ( 1 + std_loss )**0.8 # <--- this one is AWESOME
+                    # print(noise_pred.std(dim=(2,3)))
+                    # loss = loss / (1+(noise_pred.std(dim=(2,3), keepdims=True) - (4.312e-01 * timesteps.pow(1.215e-01)))**2)
+                    pred_std_loss = F.mse_loss(
+                        noise_pred.std(dim=(2,3), keepdims=True),
+                        ones * 1.05, # + acq * 0.5,
+                        reduction="none"
+                    )
+                    loss = loss / (0.5+pred_std_loss*channel_weights) + loss # (loss * (1-acq)) # (loss * acq1 / noise_pred.std(dim=(2,3), keepdims=True) ) + loss * acq2
+                    # loss = loss + base_loss.std(dim=(2,3), keepdims=True) + F.mse_loss(noise_pred.std(), noise.to(dtype=noise_pred.dtype).std(), reduction="none")
+
+                    # loss = loss + base_loss.std(dim=(2,3), keepdims=True) * (1-ac).sqrt()
+                    # loss = loss + F.mse_loss(noise_pred, noise_scheduler.get_velocity(latents, noise, timesteps).to(dtype=noise_pred.dtype), reduction="none")
+                    # loss = base_loss.mean(dim=(2, 3), keepdims=True) + base_loss.std(dim=(2,3), keepdims=True) * (1-ac).sqrt()
+
+                    # if args.std_loss_weight:
+                    # std_loss = F.mse_loss(noise_pred.std(dim=(2,3), keepdim=True), noise.std(dim=(2,3), keepdim=True), reduction="none")
+                    # loss = loss + std_loss * (alphas_cumprod)[timesteps]
+                    # loss = loss + noise_pred.std(dim=(2,3), keepdim=True) * 0.1
+
+                    # step_logs["loss/std_loss"] = std_loss.mean().item()
+                    step_logs["metrics/std"] = noise_pred.std(dim=(2,3), keepdim=True).mean().item()
+                    # step_logs["metrics/std_divergence"] = (noise_pred.std(dim=(2,3), keepdim=True) - noise.std(dim=(2,3), keepdim=True)).mean().item()
+
+                    # if args.masked_loss and np.random.rand() < args.masked_loss_prob:
+                    #     loss = apply_masked_loss(loss, batch)
 
                     loss = loss.mean(dim=(1,2,3))
 
@@ -920,6 +987,20 @@ class NetworkTrainer:
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
+                    # masked_noise_pred = F.relu(noise_pred) + F.relu(-noise_pred)
+                    # masked_noise_pred = masked_noise_pred * (masked_noise_pred > 3).int() - torch.ones_like(masked_noise_pred) * 3 * (masked_noise_pred > 3).int()
+                    # masked_noise_true = F.relu(noise) + F.relu(-noise)
+                    # masked_noise_true = masked_noise_true * (masked_noise_true > 3).int() - torch.ones_like(masked_noise_true) * 3 * (masked_noise_true > 3).int()
+
+                    # step_logs["metrics/oob_pixels_1"]        = (noise_pred[noise_pred.abs() > 1].abs() - 1).sum() / (noise[noise.abs() > 1].abs() - 1).sum() / noise_pred.size(0)
+                    # step_logs["metrics/oob_pixels_2"]        = (noise_pred[noise_pred.abs() > 2].abs() - 2).sum() / (noise[noise.abs() > 2].abs() - 2).sum() / noise_pred.size(0)
+                    # step_logs["metrics/oob_pixels_3"]        = (noise_pred[noise_pred.abs() > 3].abs() - 3).sum() / (noise[noise.abs() > 3].abs() - 3).sum() / noise_pred.size(0)
+
+                    # step_logs["metrics/noise_pred_mean"]     = noise_pred.mean()
+                    # step_logs["metrics/noise_pred_std"]      = (pred_std.mean()).item()
+                    # step_logs["metrics/std_divergence"]      = (true_std.mean() - pred_std.mean()).item()
+                    # step_logs["metrics/skew_divergence"]     = (true_skews.mean() - pred_skews.mean()).item()
+                    # step_logs["metrics/kurtosis_divergence"] = (true_kurtoses.mean() - pred_kurtoses.mean()).item()
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
