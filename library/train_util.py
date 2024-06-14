@@ -4925,9 +4925,28 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
     return timesteps, huber_c
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, std_by_ts, mean_by_ts):
+    # Sample a random timestep for each image
+    b_size = latents.shape[0]
+    min_timestep = 0 if args.min_timestep is None else args.min_timestep
+    max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
+
+    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
+
     # Sample noise that we'll add to the latents
-    noise = torch.randn_like(latents, device=latents.device)
+    channels = []
+    for t in timesteps:
+        for i in range(0, 4):
+            if i == 0 or i == 3:
+                mean = mean_by_ts[t][i] # We only use the shifted means for the first and last channels
+            else:
+                mean = 0
+            channels.append(
+                torch.empty((1, 1, latents.shape[2], latents.shape[3]), device=latents.device)
+                     .normal_(mean=mean, std=std_by_ts[t][i])
+            )
+    noise = torch.cat(channels, dim=0).reshape(latents.shape)
+    # noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         if args.noise_offset_random_strength:
             noise_offset = torch.rand(1, device=latents.device) * args.noise_offset
@@ -4938,13 +4957,6 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
         noise = custom_train_functions.pyramid_noise_like(
             noise, latents.device, args.multires_noise_iterations, args.multires_noise_discount
         )
-
-    # Sample a random timestep for each image
-    b_size = latents.shape[0]
-    min_timestep = 0 if args.min_timestep is None else args.min_timestep
-    max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
-
-    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
     # Add noise to the latents according to the noise magnitude at each timestep
     # (this is the forward diffusion process)
@@ -4958,15 +4970,6 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents):
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
     return noise, noisy_latents, timesteps, huber_c
-
-
-def noise_stats(noise):
-    diff     = noise - noise.mean(dim=(1,2,3), keepdim=True)
-    std      = noise.std(dim=(1,2,3))
-    zscores  = diff / std[:, None, None, None]
-    skews    = (zscores**3).mean(dim=(1,2,3))
-    kurtoses = (zscores**4).mean(dim=(1,2,3)) - 3.0
-    return std, skews, kurtoses
 
 
 # NOTE: if you're using the scheduled version, huber_c has to depend on the timesteps already
