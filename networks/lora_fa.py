@@ -37,6 +37,7 @@ class LoRAModule(torch.nn.Module):
         dropout=None,
         rank_dropout=None,
         module_dropout=None,
+        dynamic_dim=False
     ):
         """if alpha == 0 or None, alpha is rank (no scaling)."""
         super().__init__()
@@ -54,7 +55,11 @@ class LoRAModule(torch.nn.Module):
         #   if self.lora_dim != lora_dim:
         #     logger.info(f"{lora_name} dim (rank) is changed to: {self.lora_dim}")
         # else:
-        self.lora_dim = lora_dim
+        if dynamic_dim:
+            self.lora_dim = min(in_dim, out_dim) // lora_dim
+            alpha = alpha * self.lora_dim
+        else:
+            self.lora_dim = lora_dim
 
         if org_module.__class__.__name__ == "Conv2d":
             kernel_size = org_module.kernel_size
@@ -149,7 +154,7 @@ class LoRAInfModule(LoRAModule):
         **kwargs,
     ):
         # no dropout for inference
-        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha)
+        super().__init__(lora_name, org_module, multiplier, lora_dim, alpha, dynamic_dim=False)
 
         self.org_module_ref = [org_module]  # 後から参照できるように
         self.enabled = True
@@ -443,6 +448,7 @@ def create_network(
     # extract dim/alpha for conv2d, and block dim
     conv_dim = kwargs.get("conv_dim", None)
     conv_alpha = kwargs.get("conv_alpha", None)
+    dynamic_dim = kwargs.get("dynamic_dim", False)
     if conv_dim is not None:
         conv_dim = int(conv_dim)
         if conv_alpha is None:
@@ -498,6 +504,7 @@ def create_network(
         block_alphas=block_alphas,
         conv_block_dims=conv_block_dims,
         conv_block_alphas=conv_block_alphas,
+        dynamic_dim=dynamic_dim,
         varbose=True,
     )
 
@@ -779,6 +786,7 @@ class LoRANetwork(torch.nn.Module):
         block_alphas: Optional[List[float]] = None,
         conv_block_dims: Optional[List[int]] = None,
         conv_block_alphas: Optional[List[float]] = None,
+        dynamic_dim: Optional[bool] = False,
         modules_dim: Optional[Dict[str, int]] = None,
         modules_alpha: Optional[Dict[str, int]] = None,
         module_class: Type[object] = LoRAModule,
@@ -889,6 +897,7 @@ class LoRANetwork(torch.nn.Module):
                                 dropout=dropout,
                                 rank_dropout=rank_dropout,
                                 module_dropout=module_dropout,
+                                dynamic_dim=dynamic_dim,
                             )
                             loras.append(lora)
             return loras, skipped
