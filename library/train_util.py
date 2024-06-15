@@ -3376,6 +3376,13 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         nargs="*",
         help='additional arguments for autostats',
     )
+    parser.add_argument(
+        "--autostats_weights",
+        type=float,
+        default=[1.0, 0.1],
+        nargs=2,
+        help='weights for autostats loss, as [std, mean]',
+    )
 
 
     if support_dreambooth:
@@ -4952,10 +4959,9 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, std_by
         channels = []
         for t in timesteps:
             for i in range(0, 4):
+                # mean = 0
                 std = std_by_ts[t][i][0][0]
-                mean = 0
-                # if i == 0 or i == 3:
-                #     mean = mean_by_ts[t][i][0][0] # We only use the shifted means for the first and last channels
+                mean = mean_by_ts[t][i][0][0]
                 channels.append( torch.empty((1, 1, latents.shape[2], latents.shape[3]), device=latents.device).normal_(mean=mean, std=std) )
         noise = torch.cat(channels, dim=0).reshape(latents.shape)
     else:

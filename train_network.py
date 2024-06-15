@@ -813,6 +813,15 @@ class NetworkTrainer:
 
         if args.autostats:
             std_target_by_ts, mean_target_by_ts = get_timestep_stats(args, accelerator, unet, text_encoder, tokenizer, noise_scheduler)
+
+            ts = torch.arange(0, 1000, device=accelerator.device)
+
+            # this is a sigmoid that keeps Y very low until timestep ~250 or so. The denominator (90) is arbitrily chosen
+            # to produce the shape of the curve that is roughly desired. This weighting function could probably be improved.
+            mean_scale = 1 / (1 + torch.exp(-(ts-500) / 90))
+            mean_target_by_ts = mean_target_by_ts * mean_scale.view(-1, 1, 1, 1)
+            std_target_by_ts = std_target_by_ts # * (1-mean_scale.view(-1, 1, 1, 1))
+
             print("std", std_target_by_ts.view(-1, 4))
             print("mean", mean_target_by_ts.view(-1, 4))
         else:
@@ -883,7 +892,7 @@ class NetworkTrainer:
                         args, noise_scheduler, latents, std_target_by_ts, mean_target_by_ts
                     )
 
-                    ts_ac = alphas_cumprod[timesteps]
+                    ts_ac = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
 
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
@@ -918,24 +927,19 @@ class NetworkTrainer:
                     mask = get_mask(batch, noisy_latents)
                     noise_pred.register_hook(lambda grad: grad * mask)
 
-                    sqrt_alphas = alphas_cumprod[timesteps].sqrt()
-                    sqrt_one_minus_alphas = (1 - alphas_cumprod[timesteps]).sqrt()
-
                     if std_target_by_ts is not None:
-                        pred_std_loss_weight = 1.0
-                        pred_mean_loss_weight = 1.0
+                        pred_std_loss_weight = args.autostats_weights[0]
+                        pred_mean_loss_weight = args.autostats_weights[1]
                         loss = base_loss.mean(dim=(2, 3), keepdims=True)
 
                         std_weights = std_target_by_ts[timesteps]
                         pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True), std_weights, reduction="none" )
+                        loss = loss + pred_std_loss
 
-                        mean_weights = torch.zeros_like(std_weights) # mean_target_by_ts[timesteps]
+                        # mean_weights = torch.zeros_like(std_weights)
+                        mean_weights = mean_target_by_ts[timesteps]
                         pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True), mean_weights, reduction="none" )
-
-                        # if pred_std_loss.max() > 0.01:
-                        #     print("Got std losses", pred_std_loss, "for timesteps", timesteps)
-
-                        loss = loss * sqrt_one_minus_alphas.view(-1, 1, 1, 1) + pred_std_loss * sqrt_alphas # + pred_mean_loss * pred_mean_loss_weight
+                        loss = loss + pred_mean_loss
 
                         step_logs["losses/base_loss"] = base_loss.mean().item()
                         step_logs["losses/pred_std_loss"] = (pred_std_loss * pred_std_loss_weight).mean().item()
