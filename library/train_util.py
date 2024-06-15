@@ -3363,6 +3363,20 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=None,
         help="Weight for standard deviation loss. Encourages the model to learn noise with a stddev like the true noise. May prevent 'deep fry'. 1.0 is a good starting place.",
     )
+    parser.add_argument(
+        "--autostats",
+        type=str,
+        default=None,
+        help="If set, generate and use autostats"
+    )
+    parser.add_argument(
+        "--autostats_args",
+        type=str,
+        default=None,
+        nargs="*",
+        help='additional arguments for autostats',
+    )
+
 
     if support_dreambooth:
         # DreamBooth training
@@ -4934,19 +4948,18 @@ def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, std_by
     timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
 
     # Sample noise that we'll add to the latents
-    channels = []
-    for t in timesteps:
-        for i in range(0, 4):
-            if i == 0 or i == 3:
-                mean = mean_by_ts[t][i] # We only use the shifted means for the first and last channels
-            else:
+    if std_by_ts is not None:
+        channels = []
+        for t in timesteps:
+            for i in range(0, 4):
+                std = std_by_ts[t][i][0][0]
                 mean = 0
-            channels.append(
-                torch.empty((1, 1, latents.shape[2], latents.shape[3]), device=latents.device)
-                     .normal_(mean=mean, std=std_by_ts[t][i])
-            )
-    noise = torch.cat(channels, dim=0).reshape(latents.shape)
-    # noise = torch.randn_like(latents, device=latents.device)
+                # if i == 0 or i == 3:
+                #     mean = mean_by_ts[t][i][0][0] # We only use the shifted means for the first and last channels
+                channels.append( torch.empty((1, 1, latents.shape[2], latents.shape[3]), device=latents.device).normal_(mean=mean, std=std) )
+        noise = torch.cat(channels, dim=0).reshape(latents.shape)
+    else:
+        noise = torch.randn_like(latents, device=latents.device)
     if args.noise_offset:
         if args.noise_offset_random_strength:
             noise_offset = torch.rand(1, device=latents.device) * args.noise_offset

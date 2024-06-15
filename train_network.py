@@ -811,9 +811,15 @@ class NetworkTrainer:
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
-        std_target_by_ts, mean_target_by_ts = get_timestep_stats(accelerator, unet, text_encoder, tokenizer, noise_scheduler)
-        print("std", std_target_by_ts)
-        print("mean", mean_target_by_ts)
+        if args.autostats:
+            std_target_by_ts, mean_target_by_ts = get_timestep_stats(args, accelerator, unet, text_encoder, tokenizer, noise_scheduler)
+            print("std", std_target_by_ts.view(-1, 4))
+            print("mean", mean_target_by_ts.view(-1, 4))
+        else:
+            std_target_by_ts = None
+            mean_target_by_ts = None
+
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -877,6 +883,8 @@ class NetworkTrainer:
                         args, noise_scheduler, latents, std_target_by_ts, mean_target_by_ts
                     )
 
+                    ts_ac = alphas_cumprod[timesteps]
+
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
                         for x in noisy_latents:
@@ -910,36 +918,40 @@ class NetworkTrainer:
                     mask = get_mask(batch, noisy_latents)
                     noise_pred.register_hook(lambda grad: grad * mask)
 
-                    pred_std_loss_weight = 1.0
-                    pred_mean_loss_weight = 1.0
-                    loss = base_loss.mean(dim=(2, 3), keepdims=True)
+                    sqrt_alphas = alphas_cumprod[timesteps].sqrt()
+                    sqrt_one_minus_alphas = (1 - alphas_cumprod[timesteps]).sqrt()
 
-                    std_weights = std_target_by_ts[timesteps]
-                    pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True), std_weights, reduction="none" )
+                    if std_target_by_ts is not None:
+                        pred_std_loss_weight = 1.0
+                        pred_mean_loss_weight = 1.0
+                        loss = base_loss.mean(dim=(2, 3), keepdims=True)
 
-                    mean_weights = mean_target_by_ts[timesteps]
-                    pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True), mean_weights, reduction="none" )
+                        std_weights = std_target_by_ts[timesteps]
+                        pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True), std_weights, reduction="none" )
 
-                    # if pred_std_loss.max() > 0.01:
-                    #     print("Got std losses", pred_std_loss, "for timesteps", timesteps)
+                        mean_weights = torch.zeros_like(std_weights) # mean_target_by_ts[timesteps]
+                        pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True), mean_weights, reduction="none" )
 
-                    loss = loss + pred_std_loss * pred_std_loss_weight # + pred_mean_loss * pred_mean_loss_weight
+                        # if pred_std_loss.max() > 0.01:
+                        #     print("Got std losses", pred_std_loss, "for timesteps", timesteps)
 
-                    step_logs["losses/base_loss"] = base_loss.mean().item()
-                    step_logs["losses/pred_std_loss"] = (pred_std_loss * pred_std_loss_weight).mean().item()
-                    step_logs["losses/pred_mean_loss"] = (pred_mean_loss * pred_mean_loss_weight).mean().item()
+                        loss = loss * sqrt_one_minus_alphas.view(-1, 1, 1, 1) + pred_std_loss * sqrt_alphas # + pred_mean_loss * pred_mean_loss_weight
 
-                    ch_std = noise_pred.std(dim=(0,2,3))
-                    step_logs["metrics/std_ch_0"] = ch_std[0].item()
-                    step_logs["metrics/std_ch_1"] = ch_std[1].item()
-                    step_logs["metrics/std_ch_2"] = ch_std[2].item()
-                    step_logs["metrics/std_ch_3"] = ch_std[3].item()
+                        step_logs["losses/base_loss"] = base_loss.mean().item()
+                        step_logs["losses/pred_std_loss"] = (pred_std_loss * pred_std_loss_weight).mean().item()
+                        step_logs["losses/pred_mean_loss"] = (pred_mean_loss * pred_mean_loss_weight).mean().item()
 
-                    ch_mean = noise_pred.mean(dim=(0,2,3))
-                    step_logs["metrics/mean_ch_0"] = ch_mean[0].item()
-                    step_logs["metrics/mean_ch_1"] = ch_mean[1].item()
-                    step_logs["metrics/mean_ch_2"] = ch_mean[2].item()
-                    step_logs["metrics/mean_ch_3"] = ch_mean[3].item()
+                        ch_std = noise_pred.std(dim=(0,2,3))
+                        step_logs["metrics/std_ch_0"] = ch_std[0].item()
+                        step_logs["metrics/std_ch_1"] = ch_std[1].item()
+                        step_logs["metrics/std_ch_2"] = ch_std[2].item()
+                        step_logs["metrics/std_ch_3"] = ch_std[3].item()
+
+                        ch_mean = noise_pred.mean(dim=(0,2,3))
+                        step_logs["metrics/mean_ch_0"] = ch_mean[0].item()
+                        step_logs["metrics/mean_ch_1"] = ch_mean[1].item()
+                        step_logs["metrics/mean_ch_2"] = ch_mean[2].item()
+                        step_logs["metrics/mean_ch_3"] = ch_mean[3].item()
 
                     loss = loss.mean(dim=(1,2,3))
 

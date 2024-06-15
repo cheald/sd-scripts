@@ -1,3 +1,4 @@
+import ast
 import math
 import torch
 from tqdm import tqdm
@@ -5,6 +6,7 @@ from einops import repeat
 import os
 from safetensors.torch import save_file
 from safetensors import safe_open
+import numpy as np
 
 from library.utils import setup_logging, add_logging_arguments
 
@@ -51,28 +53,60 @@ DEFAULT_PROMPTS = [
     "A photo of a person practicing yoga.",
 ]
 
-def get_timestep_stats(args, accelerator, unet, text_encoder, tokenizer, noise_scheduler, steps=50):
-    stats_filename = f"{os.path.basename(args.pretrained_model_name_or_path)}-target_stats.safetensors"
+# The curve is much sharper at lower timesteps, so we sample them at a higher resolution.
+TIMESTEPS = [
+        999,979,958,938,918,897,877,856,836,816,795,775,755,734,714,693,673,653,
+        632,612,592,571,551,531,510,490,469,449,429,408,388,368,347,327,307,286,
+        266,245,225,205,184,164,144,123,103,82,62,42,31,21,19,17,15,13,11,9,8,7,
+        6,5,4,3,2,1
+]
+
+def interp(t, timesteps):
+    p = t.permute(1, 0)
+    ch = []
+    for i in range(0, 4):
+        x = list(np.interp(np.arange(0, 1000), list(reversed(timesteps)), p[i].flip(0).cpu().numpy()))
+        ch.append( torch.tensor(x) )
+    return torch.stack(ch).permute(1, 0).to(t.device)
+
+def get_timestep_stats(args, accelerator, unet, text_encoder, tokenizer, noise_scheduler):
+    stats_filename = args.autostats
+    timesteps = TIMESTEPS
     if os.path.exists(stats_filename):
-        with safe_open(stats_filename, framework="pt", device=accelerator.device) as f:
-            std_target_by_ts = f.get_tensor("std")
-            mean_target_by_ts = f.get_tensor("mean")
+        with safe_open(stats_filename, framework="pt") as f:
+            std_means = f.get_tensor("std")
+            mean_means = f.get_tensor("mean")
+            timesteps = f.get_tensor("timesteps").tolist()
     else:
-        std_target_by_ts, mean_target_by_ts = generate_timestep_stats(accelerator, unet, text_encoder, tokenizer, noise_scheduler)
+        autostats_kwargs = {}
+        if args.autostats_args is not None and len(args.autostats_args) > 0:
+            for arg in args.autostats_args:
+                key, value = arg.split("=")
+                value = ast.literal_eval(value)
+                autostats_kwargs[key] = value
+
+        std_means, mean_means = generate_timestep_stats(accelerator, unet, text_encoder, tokenizer, noise_scheduler, height=args.resolution[1], width=args.resolution[0], **autostats_kwargs)
         save_file({
-            "std": std_target_by_ts.contiguous(),
-            "mean": mean_target_by_ts.contiguous()
+            "std": std_means.contiguous(),
+            "mean": mean_means.contiguous(),
+            "timesteps": torch.tensor(TIMESTEPS),
         }, stats_filename)
-    return std_target_by_ts.view(-1, 4, 1, 1), mean_target_by_ts.view(-1, 4, 1, 1)
+
+    std_target_by_ts = interp(std_means, timesteps).to(device=accelerator.device, dtype=torch.float32).view(-1, 4, 1, 1)
+    mean_target_by_ts = interp(mean_means, timesteps).to(device=accelerator.device, dtype=torch.float32).view(-1, 4, 1, 1)
+
+    return std_target_by_ts, mean_target_by_ts
 
 
-def generate_timestep_stats(accelerator, unet, text_encoder, tokenizer, scheduler, steps=50, clip_skip=-1):
+def generate_timestep_stats(accelerator, unet, text_encoder, tokenizer, scheduler, steps=50, clip_skip=-1, width=1024, height=1024, prompts=10):
     logger.info("Generating noise stats for model...this is going to take a moment")
     unet = accelerator.unwrap_model(unet)
     if isinstance(text_encoder, (list, tuple)):
         text_encoder = [accelerator.unwrap_model(te) for te in text_encoder]
     else:
         text_encoder = accelerator.unwrap_model(text_encoder)
+
+    steps = len(TIMESTEPS)
 
     step_stds  = [[] for i in range(0, steps)]
     step_means = [[] for i in range(0, steps)]
@@ -81,28 +115,31 @@ def generate_timestep_stats(accelerator, unet, text_encoder, tokenizer, schedule
         step_means[step].append(noise_pred.mean(dim=(0, 2, 3)))
 
     with torch.no_grad():
-        unet.set_use_memory_efficient_attention(True, False)
-        for prompt in tqdm(DEFAULT_PROMPTS[:10]):
-            run_sdxl(prompt, unet, steps,
-                        guidance_scale=7.5,
-                        scheduler=scheduler,
-                        tokenizer1=tokenizer[0],
-                        text_model1=text_encoder[0],
-                        tokenizer2=tokenizer[1],
-                        text_model2=text_encoder[1],
-                        height=1024,
-                        width=1024,
-                        device=accelerator.device,
-                        callback=callback)
+        with tqdm(total=prompts*steps) as pbar:
+            for prompt in DEFAULT_PROMPTS[:prompts]:
+                run_sdxl(prompt, unet, steps,
+                            guidance_scale=7.5,
+                            scheduler=scheduler,
+                            tokenizer1=tokenizer[0],
+                            text_model1=text_encoder[0],
+                            tokenizer2=tokenizer[1],
+                            text_model2=text_encoder[1],
+                            height=height,
+                            width=width,
+                            device=accelerator.device,
+                            callback=callback,
+                            pbar=pbar)
 
     std_means  = torch.stack([torch.stack(s).mean(dim=0) for s in step_stds])
     mean_means = torch.stack([torch.stack(s).mean(dim=0) for s in step_means])
-    full_stds = torch.nn.functional.interpolate(std_means.unsqueeze(0).permute(0, 2, 1), size=1000).permute(0, 2, 1).squeeze(0).flip(0)
-    full_means = torch.nn.functional.interpolate(mean_means.unsqueeze(0).permute(0, 2, 1), size=1000).permute(0, 2, 1).squeeze(0).flip(0)
 
-    return full_stds, full_means
+    return std_means, mean_means
 
-def run_sdxl(prompt, unet, steps, guidance_scale, scheduler, tokenizer1, text_model1, tokenizer2, text_model2, height, width, device, callback, top=0, left=0):
+def run_sd15():
+    pass
+
+
+def run_sdxl(prompt, unet, steps, guidance_scale, scheduler, tokenizer1, text_model1, tokenizer2, text_model2, height, width, device, callback, pbar, top=0, left=0):
     def timestep_embedding(timesteps, dim, max_period=10000, repeat_only=False):
         """
         Create sinusoidal timestep embeddings.
@@ -188,11 +225,11 @@ def run_sdxl(prompt, unet, steps, guidance_scale, scheduler, tokenizer1, text_mo
     c_vector = torch.cat([c_ctx_pool, c_vector], dim=1)
 
     # uncond
-    uc_ctx, uc_ctx_pool = call_text_encoder("", "")
-    uc_vector = torch.cat([uc_ctx_pool, uc_vector], dim=1)
+    # uc_ctx, uc_ctx_pool = call_text_encoder("", "")
+    # uc_vector = torch.cat([uc_ctx_pool, uc_vector], dim=1)
 
-    text_embeddings = torch.cat([uc_ctx, c_ctx])
-    vector_embeddings = torch.cat([uc_vector, c_vector])
+    text_embeddings = torch.cat([c_ctx])
+    vector_embeddings = torch.cat([c_vector])
 
     latents_shape = (1, 4, height // 8, width // 8)
     latents = torch.randn(
@@ -206,12 +243,13 @@ def run_sdxl(prompt, unet, steps, guidance_scale, scheduler, tokenizer1, text_mo
     latents = latents * scheduler.init_noise_sigma
 
     # set timesteps
-    scheduler.set_timesteps(steps, device)
+    # scheduler.set_timesteps(steps, device)
+    scheduler.timesteps = torch.tensor(TIMESTEPS, device=device)
 
     # このへんはDiffusersからのコピペ
     # Copy from Diffusers
     timesteps = scheduler.timesteps.to(device)
-    num_latent_input = 2
+    num_latent_input = 1
 
     for i, t in enumerate(timesteps):
         # expand the latents if we are doing classifier free guidance
@@ -219,9 +257,10 @@ def run_sdxl(prompt, unet, steps, guidance_scale, scheduler, tokenizer1, text_mo
         latent_model_input = scheduler.scale_model_input(latent_model_input, t)
 
         noise_pred = unet(latent_model_input, t, text_embeddings, vector_embeddings)
+        pbar.update(1)
 
-        noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_latent_input)  # uncond by negative prompt
-        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
+        # noise_pred_uncond, noise_pred_text = noise_pred.chunk(num_latent_input)  # uncond by negative prompt
+        # noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_text - noise_pred_uncond)
 
         callback(i, noise_pred)
 
