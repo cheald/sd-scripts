@@ -812,15 +812,19 @@ class NetworkTrainer:
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
         if args.autostats:
-            std_target_by_ts, mean_target_by_ts = get_timestep_stats(args, accelerator, unet, text_encoder, tokenizer, noise_scheduler)
+            std_target_by_ts, mean_target_by_ts = get_timestep_stats(args, accelerator, unet, vae, text_encoder, tokenizer, noise_scheduler, self.is_sdxl)
 
             ts = torch.arange(0, 1000, device=accelerator.device)
 
             # this is a sigmoid that keeps Y very low until timestep ~250 or so. The denominator (90) is arbitrily chosen
             # to produce the shape of the curve that is roughly desired. This weighting function could probably be improved.
             mean_scale = 1 / (1 + torch.exp(-(ts-500) / 90))
-            mean_target_by_ts = mean_target_by_ts * mean_scale.view(-1, 1, 1, 1)
-            std_target_by_ts = std_target_by_ts # * (1-mean_scale.view(-1, 1, 1, 1))
+            # mean_target_by_ts = mean_target_by_ts * mean_scale.view(-1, 1, 1, 1)
+            std_target_by_ts = std_target_by_ts
+
+            effect_scale = args.autostats_weights
+            std_target_by_ts = 1.0 - (1.0-std_target_by_ts.to(dtype=weight_dtype)) * effect_scale[0]
+            mean_target_by_ts = mean_target_by_ts.to(dtype=weight_dtype) * effect_scale[1]
 
             print("std", std_target_by_ts.view(-1, 4))
             print("mean", mean_target_by_ts.view(-1, 4))
@@ -924,12 +928,11 @@ class NetworkTrainer:
                         noise_pred.float(), target.float(), reduction="none", loss_type=args.loss_type, huber_c=huber_c
                     )
 
-                    mask = get_mask(batch, noisy_latents)
+                    mask = get_mask(batch, noisy_latents).to(dtype=weight_dtype)
                     noise_pred.register_hook(lambda grad: grad * mask)
 
+                    loss = base_loss
                     if std_target_by_ts is not None:
-                        pred_std_loss_weight = args.autostats_weights[0]
-                        pred_mean_loss_weight = args.autostats_weights[1]
                         loss = base_loss.mean(dim=(2, 3), keepdims=True)
 
                         std_weights = std_target_by_ts[timesteps]
@@ -942,8 +945,8 @@ class NetworkTrainer:
                         loss = loss + pred_mean_loss
 
                         step_logs["losses/base_loss"] = base_loss.mean().item()
-                        step_logs["losses/pred_std_loss"] = (pred_std_loss * pred_std_loss_weight).mean().item()
-                        step_logs["losses/pred_mean_loss"] = (pred_mean_loss * pred_mean_loss_weight).mean().item()
+                        step_logs["losses/pred_std_loss"] = pred_std_loss.mean().item()
+                        step_logs["losses/pred_mean_loss"] = pred_mean_loss.mean().item()
 
                         ch_std = noise_pred.std(dim=(0,2,3))
                         step_logs["metrics/std_ch_0"] = ch_std[0].item()

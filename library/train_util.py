@@ -3370,18 +3370,24 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help="If set, generate and use autostats"
     )
     parser.add_argument(
-        "--autostats_args",
+        "--autostats_prompts",
         type=str,
         default=None,
         nargs="*",
-        help='additional arguments for autostats',
+        help='Prompts to use for autostats collection',
+    )
+    parser.add_argument(
+        "--autostats_batch_size",
+        type=int,
+        default=1,
+        help='Number of prompts to process at a time',
     )
     parser.add_argument(
         "--autostats_weights",
         type=float,
-        default=[1.0, 0.1],
         nargs=2,
-        help='weights for autostats loss, as [std, mean]',
+        default=[1.0, 1.0],
+        help='Effect size; larger means more detail. Arg 0 is standard deviation, arg 1 is mean.',
     )
 
 

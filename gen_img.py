@@ -86,7 +86,7 @@ CLIP_VISION_MODEL = "laion/CLIP-ViT-bigG-14-laion2B-39B-b160k"
 """
 
 
-def replace_unet_modules(unet: diffusers.models.unet_2d_condition.UNet2DConditionModel, mem_eff_attn, xformers, sdpa):
+def replace_unet_modules(unet, mem_eff_attn, xformers, sdpa):
     if mem_eff_attn:
         logger.info("Enable memory efficient attention for U-Net")
 
@@ -398,6 +398,12 @@ class PipelineLike:
             logger.info(f"gradual_latent is enabled: {gradual_latent}")
             self.gradual_latent = gradual_latent  # (ds_ratio, start_timesteps, every_n_steps, ratio_step)
 
+    def set_timesteps(self, timesteps, manual_timesteps):
+        if manual_timesteps is not None:
+            self.scheduler.timesteps = torch.tensor(manual_timesteps, device=self.device)
+        else:
+            self.scheduler.set_timesteps(timesteps, self.device)
+
     @torch.no_grad()
     def __call__(
         self,
@@ -414,6 +420,7 @@ class PipelineLike:
         crop_top: int = 0,
         crop_left: int = 0,
         num_inference_steps: int = 50,
+        manual_timesteps: Optional[List[int]] = None,
         guidance_scale: float = 7.5,
         negative_scale: float = None,
         strength: float = 0.8,
@@ -427,6 +434,7 @@ class PipelineLike:
         return_latents: bool = False,
         # return_dict: bool = True,
         callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        noise_callback: Optional[Callable[[int, torch.IntTensor, torch.FloatTensor], None]] = None,
         is_cancelled_callback: Optional[Callable[[], bool]] = None,
         callback_steps: Optional[int] = 1,
         img2img_noise=None,
@@ -606,7 +614,7 @@ class PipelineLike:
                 vector_embeddings = c_vector
 
         # set timesteps
-        self.scheduler.set_timesteps(num_inference_steps, self.device)
+        self.set_timesteps(num_inference_steps, manual_timesteps)
 
         latents_dtype = text_embeddings.dtype
         init_latents_orig = None
@@ -841,6 +849,9 @@ class PipelineLike:
                         + guidance_scale * (noise_pred_text - noise_pred_uncond)
                         - negative_scale * (noise_pred_negative - noise_pred_uncond)
                     )
+
+            if noise_callback is not None:
+                noise_callback(i, t, noise_pred)
 
             # compute the previous noisy sample x_t -> x_t-1
             latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
@@ -2916,7 +2927,7 @@ def setup_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
 
     add_logging_arguments(parser)
-    
+
     parser.add_argument(
         "--sdxl", action="store_true", help="load Stable Diffusion XL model / Stable Diffusion XLのモデルを読み込む"
     )
