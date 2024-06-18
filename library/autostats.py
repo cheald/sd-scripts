@@ -83,7 +83,7 @@ def get_timestep_stats(args, accelerator, unet, vae, text_encoder, tokenizer, no
             accelerator, unet, vae, text_encoder, tokenizer, noise_scheduler, is_sdxl,
             height=args.resolution[1],
             width=args.resolution[0],
-            batch_size=args.batch_size,
+            batch_size=args.train_batch_size,
             prompts=prompts
         )
 
