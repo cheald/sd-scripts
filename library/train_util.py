@@ -3383,11 +3383,30 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         help='Number of prompts to process at a time',
     )
     parser.add_argument(
-        "--autostats_weights",
+        "--autostats_true_noise_weight",
         type=float,
         nargs=2,
         default=[1.0, 1.0],
         help='Effect size; larger means more detail. Arg 0 is standard deviation, arg 1 is mean.',
+    )
+    parser.add_argument(
+        "--autostats_loss_weights",
+        type=float,
+        nargs=2,
+        default=[1.0, 1.0],
+        help='Loss weights for std/mean',
+    )
+    parser.add_argument(
+        "--autostats_decay_rate",
+        type=float,
+        default=0.0,
+        help='Decay rate for autostats loss weight. 0 = no decay.',
+    )
+    parser.add_argument(
+        "--autostats_effect_min",
+        type=float,
+        default=0.0,
+        help='Minimum effect size for autostats',
     )
 
 
