@@ -942,14 +942,14 @@ class NetworkTrainer:
                         loss = base_loss.mean(dim=(2, 3), keepdims=True)
 
                         std_weights = std_target_by_ts[timesteps]
-                        std_weights = target.std(dim=(2,3), keepdims=True).to(dtype=weight_dtype)
-                        pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True), std_weights, reduction="none" )
+                        std_weights = target.std(dim=(2,3), keepdims=True).float()
+                        pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True).float(), std_weights, reduction="none" )
                         if args.autostats_loss_weights[0] > 0:
                             loss = loss + pred_std_loss * autostats_weight * args.autostats_loss_weights[0]
 
                         mean_weights = mean_target_by_ts[timesteps]
-                        mean_weights = target.mean(dim=(2,3), keepdims=True).to(dtype=weight_dtype)
-                        pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True), mean_weights, reduction="none" )
+                        mean_weights = target.mean(dim=(2,3), keepdims=True).float()
+                        pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True).float(), mean_weights, reduction="none" )
                         if args.autostats_loss_weights[1] > 0:
                             loss = loss + pred_mean_loss * autostats_weight * args.autostats_loss_weights[1]
 
