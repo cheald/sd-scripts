@@ -1,152 +1,110 @@
 import torch
-from tqdm import tqdm
+import torch.nn.functional as F
 import os
-from safetensors.torch import save_file
 from safetensors import safe_open
 import numpy as np
-from library.utils import setup_logging
-from gen_img import PipelineLike
-import random
 
+from library.utils import setup_logging
 setup_logging()
 import logging
-
 logger = logging.getLogger(__name__)
 
-DEFAULT_PROMPTS = [
-    "A photo of a cat",
-    "An artistic drawing of a woman",
-    "A fantasy landscape at night",
-    "A bustling cyberpunk city at high noon",
-    "A high resolution stock photo",
-    "A picture of a serene mountain landscape",
-    "A street scene from a small medieval village",
-    "A close up of a sunset over the ocean",
-    "A portrait of a person from the 1920s",
-    "A busy cityscape at rush hour",
-    "An abstract design with vibrant colors",
-    "A black and white photo of a horse in a field",
-    "A comic book style illustration of a superhero",
-    "A still life of fruit in a bowl",
-    "A photo of a dense jungle",
-    "A photo of a snowy winter scene",
-    "A detailed illustration of a mechanical device",
-    "A watercolor painting of a field of flowers",
-    "A minimalist black and white cityscape",
-    "A surrealist painting with distorted perspectives",
-    "A photo of a crowded market in a foreign city",
-    "A photo of a single tree in an open field",
-    "A photo of a old, dusty library",
-    "A photorealistic illustration of an animal",
-    "A detailed pencil sketch of a person",
-    "A pop art style illustration of an iconic celebrity",
-    "A photo of a construction site",
-    "A photo of a group of musicians performing",
-    "A photo of a person working in a laboratory",
-    "A photo of a person gardening",
-    "A photo of a person in a business meeting",
-    "A photo of a factory from the industrial revolution",
-    "A photo of a modern, eco-friendly building",
-    "A photo of a person hiking in the mountains",
-    "A photo of a person practicing yoga.",
-]
+standard_normal_distribution = torch.distributions.normal.Normal(torch.tensor([0.0]), torch.tensor([1.0]))
+def smooth(probs, step_size=0.5):
+    kernel = standard_normal_distribution.log_prob(torch.arange(-torch.pi, torch.pi, step_size) ).exp().to(probs.device)
+    smoothed = F.conv1d(probs[None, None, :].float(), kernel[None, None, :].float(), padding="same").reshape(-1)
+    return smoothed / smoothed.sum()
 
-# The curve is much sharper at lower timesteps, so we sample them at a higher resolution.
-TIMESTEPS = [
-        999,979,958,938,918,897,877,856,836,816,795,775,755,734,714,693,673,653,
-        632,612,592,571,551,531,510,490,469,449,429,408,388,368,347,327,307,286,
-        266,245,225,205,184,164,144,123,103,82,62,42,31,21,19,17,15,13,11,9,8,7,
-        6,5,4,3,2,1
-]
+def kerras_timesteps(n, sigma_min=0.001, sigma_max=10.0):
+    alpha_min = torch.arctan(torch.tensor(sigma_min))
+    alpha_max = torch.arctan(torch.tensor(sigma_max))
+    step_indices = torch.arange(n)
+    sigmas = torch.tan(step_indices / n * alpha_min + (1.0 - step_indices / n) * alpha_max)
+    return sigmas
 
-def interp(t, timesteps):
-    p = t.permute(1, 0)
-    ch = []
-    for i in range(0, 4):
-        x = list(np.interp(np.arange(0, 1000), list(reversed(timesteps)), p[i].flip(0).cpu().numpy()))
-        ch.append( torch.tensor(x) )
-    return torch.stack(ch).permute(1, 0).to(t.device)
+# cribbed from A111
+def read_metadata_from_safetensors(filename):
+    import json
 
-def get_timestep_stats(args, accelerator, unet, vae, text_encoder, tokenizer, noise_scheduler, is_sdxl):
-    stats_filename = args.autostats
-    timesteps = TIMESTEPS
-    if os.path.exists(stats_filename):
-        with safe_open(stats_filename, framework="pt") as f:
-            std_means = f.get_tensor("std")
-            mean_means = f.get_tensor("mean")
-            timesteps = f.get_tensor("timesteps").tolist()
-    else:
-        prompts = random.sample(DEFAULT_PROMPTS, 16)
-        if args.autostats_prompts:
-            prompts = args.autostats_prompts
-        std_means, mean_means = generate_timestep_stats(
-            accelerator, unet, vae, text_encoder, tokenizer, noise_scheduler, is_sdxl,
-            height=args.resolution[1],
-            width=args.resolution[0],
-            batch_size=args.train_batch_size,
-            prompts=prompts
-        )
+    with open(filename, mode="rb") as file:
+        metadata_len = file.read(8)
+        metadata_len = int.from_bytes(metadata_len, "little")
+        json_start = file.read(2)
 
-        save_file({
-            "std": std_means.contiguous(),
-            "mean": mean_means.contiguous(),
-            "timesteps": torch.tensor(TIMESTEPS),
-        }, stats_filename)
+        assert metadata_len > 2 and json_start in (b'{"', b"{'"), f"{filename} is not a safetensors file"
 
-    std_target_by_ts = interp(std_means.to(dtype=torch.float32), timesteps).to(device=accelerator.device, dtype=torch.float32).view(-1, 4, 1, 1)
-    mean_target_by_ts = interp(mean_means.to(dtype=torch.float32), timesteps).to(device=accelerator.device, dtype=torch.float32).view(-1, 4, 1, 1)
+        res = {}
+        try:
+            json_data = json_start + file.read(metadata_len-2)
+            json_obj = json.loads(json_data)
+            for k, v in json_obj.get("__metadata__", {}).items():
+                res[k] = v
+                if isinstance(v, str) and v[0:1] == '{':
+                    try:
+                        res[k] = json.loads(v)
+                    except Exception:
+                        pass
+        except Exception:
+             logger.error(f"Error reading metadata from file: {filename}", exc_info=True)
 
-    return std_target_by_ts, mean_target_by_ts
+        return res
 
+def interp_forward(t, timesteps):
+    p = t.permute(1, 0).float().cpu().numpy() # Switch to channel-first and flip the order from first-denoised to first-noised
+    rev_ts = torch.tensor(timesteps).tolist() # Reverse the timesteps from denoising order to noising order
+    xs = np.arange(0, 1000)
+    t = torch.stack([torch.tensor(list(np.interp(xs, rev_ts, p[i]))) for i in range(0, 4)])
+    return t.permute(1, 0).to(t.device)
 
-def generate_timestep_stats(accelerator, unet, vae, text_encoder, tokenizer, scheduler, is_sdxl, steps=50, clip_skip=1, width=1024, height=1024, batch_size=1, prompts=[]):
-    logger.info("Collecting noise stats for model. This may take a while...")
-    unet = accelerator.unwrap_model(unet)
-    if isinstance(text_encoder, (list, tuple)):
-        text_encoder = [accelerator.unwrap_model(te) for te in text_encoder]
-    else:
-        text_encoder = [accelerator.unwrap_model(text_encoder)]
+def load_model_noise_stats(args):
+    if args.autostats is None or not os.path.exists(args.autostats):
+        return None, None
+    with safe_open(args.autostats, framework="pt") as f:
+        observations = f.get_tensor("observations")
+        timesteps = f.get_tensor("timesteps")
+    return transform_observations(observations, timesteps)
 
-    if isinstance(tokenizer, (list, tuple)):
-        tokenizer = [accelerator.unwrap_model(t) for t in tokenizer]
-    else:
-        tokenizer = [accelerator.unwrap_model(tokenizer)]
+def transform_observations(observations, timesteps):
+    # shape is [timestep, sample, channels, h, w]
+    # we average on sample, h, w so that we get stats for [timestep, channel]
 
-    steps = len(TIMESTEPS)
-    step_stds  = [None for i in range(0, steps)]
-    step_means = [None for i in range(0, steps)]
+    means = observations.mean(dim=(1, 3, 4))
+    stds = observations.std(dim=(1, 3, 4))
+    return interp_forward(means, timesteps), interp_forward(stds, timesteps)
 
-    pipeline = PipelineLike(is_sdxl, accelerator.device, vae, text_encoder, tokenizer, unet, scheduler, clip_skip=clip_skip)
+def autostats(args, generator):
+    timestep_probs = torch.ones(1000)
+    std_target_by_ts = mean_target_by_ts = scaled_std_target_by_ts = scaled_mean_target_by_ts = None
 
-    with torch.no_grad(), accelerator.autocast(), tqdm(total=len(prompts)*steps) as pbar:
-        def callback(step, timestep, noise_pred):
-            pbar.update(noise_pred.shape[0])
-            stds = noise_pred.std(dim=(2, 3)).to(dtype=torch.float32)
-            means = noise_pred.mean(dim=(2, 3)).to(dtype=torch.float32)
-            if step_stds[step] is None:
-                step_stds[step] = stds
-            else:
-                step_stds[step] = torch.cat([step_stds[step], stds], dim=0)
-            if step_means[step] is None:
-                step_means[step] = means
-            else:
-                step_means[step] = torch.cat([step_means[step], means], dim=0)
+    mean_target_by_ts, std_target_by_ts = load_model_noise_stats(args)
+    if mean_target_by_ts is None:
+        generator()
+        mean_target_by_ts, std_target_by_ts = load_model_noise_stats(args)
 
-        chunked_prompts = [prompts[i:i + batch_size] for i in range(0, len(prompts), batch_size)]
-        for prompt in chunked_prompts:
-            pipeline(
-                prompt=prompt,
-                height=height,
-                width=width,
-                manual_timesteps=TIMESTEPS,
-                guidance_scale=7.5,
-                noise_callback=callback,
-                return_latents=True
-            )
+    if mean_target_by_ts is None:
+        raise ValueError("Could not load noise stats from model")
 
-    std_means  = torch.stack([s.mean(dim=0) for s in step_stds])
-    mean_means = torch.stack([s.mean(dim=0) for s in step_means])
+    std_target_by_ts = std_target_by_ts.view(-1, 4, 1, 1)
+    mean_target_by_ts = mean_target_by_ts.view(-1, 4, 1, 1)
 
-    del pipeline
+    std_weighting = (std_target_by_ts - 1).abs()
+    std_weighting = std_weighting / std_weighting.max(dim=0).values
 
-    return std_means, mean_means
+    mean_weighting = mean_target_by_ts.abs()
+    mean_weighting = mean_weighting / mean_weighting.max(dim=0).values
+
+    effect_scale = args.autostats_true_noise_weight
+    scaled_std_target_by_ts = (std_target_by_ts - 1.0) * effect_scale[0] + 1.0
+    scaled_mean_target_by_ts = (mean_target_by_ts * effect_scale[1])
+
+    if args.autostats_timestep_weighting:
+        timestep_probs = (std_target_by_ts - 1).abs().mean(dim=1).reshape(-1)
+        timestep_probs[:15] = timestep_probs[15]
+        timestep_probs = smooth(timestep_probs)
+
+    timestep_probs = timestep_probs / timestep_probs.sum()
+
+    print("std", scaled_std_target_by_ts.view(-1, 4))
+    print("mean", scaled_mean_target_by_ts.view(-1, 4))
+
+    return std_target_by_ts, mean_target_by_ts, scaled_std_target_by_ts, scaled_mean_target_by_ts, timestep_probs

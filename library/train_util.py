@@ -3408,6 +3408,16 @@ def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: 
         default=0.0,
         help='Minimum effect size for autostats',
     )
+    parser.add_argument(
+        "--autostats_timestep_weighting",
+        action="store_true",
+        help='Weight timestep selection probability by autostats',
+    )
+    parser.add_argument(
+        "--autostats_dynamic_timestep_weighting",
+        action="store_true",
+        help='When using timestep weighting, dynamically adjust the weighting based on observed losses',
+    )
 
 
     if support_dreambooth:
@@ -4939,13 +4949,26 @@ def save_sd_model_on_train_end_common(
             huggingface_util.upload(args, out_dir, "/" + model_name, force_sync_upload=True)
 
 
-def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, device):
+def get_timesteps(args, noise_scheduler, probs, b_size, device):
+    min_timestep = 0 if args.min_timestep is None else args.min_timestep
+    max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
+    if args.autostats_timestep_weighting:
+        probs = probs[min_timestep:max_timestep].float()
+        probs = probs / probs.sum()
+        cat = torch.distributions.Categorical(probs=probs)
+        timesteps = cat.sample([b_size]).to(device=device) + min_timestep
+    else:
+        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
+    return timesteps.long()
+
+
+def get_timesteps_and_huber_c(args, timesteps, noise_scheduler):
     # TODO: if a huber loss is selected, it will use constant timesteps for each batch
     # as. In the future there may be a smarter way
 
     if args.loss_type == "huber" or args.loss_type == "smooth_l1":
-        timesteps = torch.randint(min_timestep, max_timestep, (1,), device="cpu")
+        timesteps = timesteps[0].repeat(timesteps.size(0))
         timestep = timesteps.item()
 
         if args.huber_schedule == "exponential":
@@ -4959,25 +4982,20 @@ def get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler,
             huber_c = args.huber_c
         else:
             raise NotImplementedError(f"Unknown Huber loss schedule {args.huber_schedule}!")
-
-        timesteps = timesteps.repeat(b_size).to(device)
     elif args.loss_type == "l2":
-        timesteps = torch.randint(min_timestep, max_timestep, (b_size,), device=device)
         huber_c = 1  # may be anything, as it's not used
     else:
         raise NotImplementedError(f"Unknown loss type {args.loss_type}")
-    timesteps = timesteps.long()
 
     return timesteps, huber_c
 
 
-def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, std_by_ts, mean_by_ts):
+def get_noise_noisy_latents_and_timesteps(args, noise_scheduler, latents, std_by_ts, mean_by_ts, timestep_probs):
     # Sample a random timestep for each image
     b_size = latents.shape[0]
-    min_timestep = 0 if args.min_timestep is None else args.min_timestep
-    max_timestep = noise_scheduler.config.num_train_timesteps if args.max_timestep is None else args.max_timestep
 
-    timesteps, huber_c = get_timesteps_and_huber_c(args, min_timestep, max_timestep, noise_scheduler, b_size, latents.device)
+    timesteps = get_timesteps(args, noise_scheduler, timestep_probs, b_size, latents.device)
+    timesteps, huber_c = get_timesteps_and_huber_c(args, timesteps, noise_scheduler)
 
     # Sample noise that we'll add to the latents
     if std_by_ts is not None:

@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from tqdm import tqdm
 
 import torch
-from library.autostats import get_timestep_stats
+from library import autostats
 from library.device_utils import init_ipex, clean_memory_on_device
 
 init_ipex()
@@ -808,34 +808,82 @@ class NetworkTrainer:
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
 
+        def latents_from_batch(batch):
+            if "latents" in batch and batch["latents"] is not None:
+                latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
+            else:
+                with torch.no_grad():
+                    latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
+                    if torch.any(torch.isnan(latents)):
+                        accelerator.print("NaN found in latents, replacing with zeros")
+                        latents = torch.nan_to_num(latents, 0, out=latents)
+            return latents * self.vae_scale_factor
+
+        def text_conds_for_batch(batch):
+            if args.weighted_captions:
+                return get_weighted_text_embeddings(
+                    tokenizer,
+                    text_encoder,
+                    batch["captions"],
+                    accelerator.device,
+                    args.max_token_length // 75 if args.max_token_length else 1,
+                    clip_skip=args.clip_skip,
+                )
+            else:
+                return self.get_text_cond(args, accelerator, batch, tokenizers, text_encoders, weight_dtype)
+
+        def collect_model_stats():
+            samples_collected = 0
+            steps = autostats.kerras_timesteps(64)
+            steps = ((steps / steps.max()).flip(0) * 999).int()
+            observed_stats = [None] * len(steps)
+            max_observations = 5
+            with torch.no_grad(), accelerator.autocast(), tqdm(total=20, desc="Collecting model stats") as pbar:
+                for batch in train_dataloader:
+                    if samples_collected == 0:
+                        pbar.reset(max_observations * len(steps))
+                    samples_collected += batch["input_ids"].shape[0]
+                    latents = latents_from_batch(batch)
+                    text_conds = text_conds_for_batch(batch)
+                    noise = torch.randn_like(latents)
+                    for n in noise:
+                        for channel in range(0, 4):
+                            n[channel].normal_(0, 1) # Ensure that each channel has normal noise
+
+                    for index, timestep in enumerate(steps):
+                        timesteps = torch.tensor([timestep] * len(latents)).to(accelerator.device)
+                        noised = noise_scheduler.add_noise(latents, noise, timesteps)
+                        pred = self.call_unet(
+                            args,
+                            accelerator,
+                            unet,
+                            noised,
+                            timesteps,
+                            text_conds,
+                            batch,
+                            weight_dtype,
+                        )
+                        pbar.update(batch["input_ids"].shape[0])
+                        if observed_stats[index] is None:
+                            observed_stats[index] = pred
+                        else:
+                            observed_stats[index] = torch.cat([observed_stats[index], pred], dim=0)
+                    if samples_collected >= max_observations:
+                        break
+            observations = torch.stack(observed_stats)
+            from safetensors.torch import save_file
+            save_file({ "observations": observations.contiguous(), "timesteps": torch.tensor(steps) }, args.autostats)
+
+        std_target_by_ts, mean_target_by_ts, scaled_std_target_by_ts, scaled_mean_target_by_ts, timestep_probs = autostats.autostats(args, collect_model_stats)
+
+        std_target_by_ts         = std_target_by_ts.to(dtype=weight_dtype, device=accelerator.device)
+        mean_target_by_ts        = mean_target_by_ts.to(dtype=weight_dtype, device=accelerator.device)
+        scaled_std_target_by_ts  = scaled_std_target_by_ts.to(dtype=weight_dtype, device=accelerator.device)
+        scaled_mean_target_by_ts = scaled_mean_target_by_ts.to(dtype=weight_dtype, device=accelerator.device)
+        timestep_probs           = timestep_probs.to(dtype=weight_dtype, device=accelerator.device)
+
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
-
-        if args.autostats:
-            std_target_by_ts, mean_target_by_ts = get_timestep_stats(args, accelerator, unet, vae, text_encoder, tokenizer, noise_scheduler, self.is_sdxl)
-
-            ts = torch.arange(0, 1000, device=accelerator.device)
-
-            effect_scale = args.autostats_true_noise_weight
-            std_scale = effect_scale[0]
-
-            # this is a sigmoid that keeps Y very low until timestep ~250 or so. The denominator (90) is arbitrily chosen
-            # to produce the shape of the curve that is roughly desired. This weighting function could probably be improved.
-            mean_scale = effect_scale[1] # * (1 / (1 + torch.exp(-(ts-500) / 90))).view(-1, 1, 1, 1)
-
-            std_target_by_ts = std_target_by_ts.to(dtype=weight_dtype)
-            mean_target_by_ts = mean_target_by_ts.to(dtype=weight_dtype)
-
-            scaled_std_target_by_ts = (1.0 - (1.0-std_target_by_ts) * std_scale)
-            scaled_mean_target_by_ts = (mean_target_by_ts * mean_scale)
-
-            print("std", scaled_std_target_by_ts.view(-1, 4))
-            print("mean", scaled_mean_target_by_ts.view(-1, 4))
-        else:
-            std_target_by_ts = None
-            mean_target_by_ts = None
-
-        alphas_cumprod = noise_scheduler.alphas_cumprod.to(accelerator.device)
 
         # training loop
         for epoch in range(num_train_epochs):
@@ -853,18 +901,7 @@ class NetworkTrainer:
                 with accelerator.accumulate(training_model):
                     on_step_start(text_encoder, unet)
 
-                    if "latents" in batch and batch["latents"] is not None:
-                        latents = batch["latents"].to(accelerator.device).to(dtype=weight_dtype)
-                    else:
-                        with torch.no_grad():
-                            # latentに変換
-                            latents = vae.encode(batch["images"].to(dtype=vae_dtype)).latent_dist.sample().to(dtype=weight_dtype)
-
-                            # NaNが含まれていれば警告を表示し0に置き換える
-                            if torch.any(torch.isnan(latents)):
-                                accelerator.print("NaN found in latents, replacing with zeros")
-                                latents = torch.nan_to_num(latents, 0, out=latents)
-                    latents = latents * self.vae_scale_factor
+                    latents = latents_from_batch(batch)
 
                     # get multiplier for each sample
                     if network_has_multiplier:
@@ -877,29 +914,15 @@ class NetworkTrainer:
                         # print(f"set multiplier: {multipliers}")
                         accelerator.unwrap_model(network).set_multiplier(multipliers)
 
+                    # Get the text embedding for conditioning
                     with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
-                        # Get the text embedding for conditioning
-                        if args.weighted_captions:
-                            text_encoder_conds = get_weighted_text_embeddings(
-                                tokenizer,
-                                text_encoder,
-                                batch["captions"],
-                                accelerator.device,
-                                args.max_token_length // 75 if args.max_token_length else 1,
-                                clip_skip=args.clip_skip,
-                            )
-                        else:
-                            text_encoder_conds = self.get_text_cond(
-                                args, accelerator, batch, tokenizers, text_encoders, weight_dtype
-                            )
+                        text_encoder_conds = text_conds_for_batch(batch)
 
                     # Sample noise, sample a random timestep for each image, and add noise to the latents,
                     # with noise offset and/or multires noise if specified
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
-                        args, noise_scheduler, latents, scaled_std_target_by_ts, scaled_mean_target_by_ts
+                        args, noise_scheduler, latents, scaled_std_target_by_ts, scaled_mean_target_by_ts, timestep_probs
                     )
-
-                    ts_ac = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
 
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
@@ -941,33 +964,17 @@ class NetworkTrainer:
                     if std_target_by_ts is not None:
                         loss = base_loss.mean(dim=(2, 3), keepdims=True)
 
-                        std_weights = std_target_by_ts[timesteps]
-                        std_weights = target.std(dim=(2,3), keepdims=True).float()
-                        pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True).float(), std_weights, reduction="none" )
-                        if args.autostats_loss_weights[0] > 0:
-                            loss = loss + pred_std_loss * autostats_weight * args.autostats_loss_weights[0]
+                        # loss = loss * (timesteps.log()/math.log(800))**0.7
 
-                        mean_weights = mean_target_by_ts[timesteps]
-                        mean_weights = target.mean(dim=(2,3), keepdims=True).float()
-                        pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True).float(), mean_weights, reduction="none" )
-                        if args.autostats_loss_weights[1] > 0:
-                            loss = loss + pred_mean_loss * autostats_weight * args.autostats_loss_weights[1]
+                        pred_std_loss = F.mse_loss( noise_pred.std(dim=(2,3), keepdims=True).float(), std_target_by_ts[timesteps].float(), reduction="none" )
+                        loss = loss + pred_std_loss * autostats_weight * args.autostats_loss_weights[0] # * std_weighting[timesteps]
+
+                        pred_mean_loss = F.mse_loss( noise_pred.mean(dim=(2,3), keepdims=True).float(), mean_target_by_ts[timesteps].float(), reduction="none" )
+                        loss = loss + pred_mean_loss * autostats_weight * args.autostats_loss_weights[1] #  mean_weighting[timesteps] *
 
                         step_logs["losses/base_loss"] = base_loss.mean().item()
                         step_logs["losses/pred_std_loss"] = pred_std_loss.mean().item()
                         step_logs["losses/pred_mean_loss"] = pred_mean_loss.mean().item()
-
-                        ch_std_pred = pred_std_loss.mean(dim=(0, 2, 3))
-                        step_logs["losses/std_ch_0"] = ch_std_pred[0].item()
-                        step_logs["losses/std_ch_1"] = ch_std_pred[1].item()
-                        step_logs["losses/std_ch_2"] = ch_std_pred[2].item()
-                        step_logs["losses/std_ch_3"] = ch_std_pred[3].item()
-
-                        ch_mean_pred = pred_mean_loss.mean(dim=(0, 2, 3))
-                        step_logs["losses/mean_ch_0"] = ch_mean_pred[0].item()
-                        step_logs["losses/mean_ch_1"] = ch_mean_pred[1].item()
-                        step_logs["losses/mean_ch_2"] = ch_mean_pred[2].item()
-                        step_logs["losses/mean_ch_3"] = ch_mean_pred[3].item()
 
                         ch_std = noise_pred.std(dim=(0,2,3))
                         step_logs["metrics/std_ch_0"] = ch_std[0].item()
@@ -983,6 +990,11 @@ class NetworkTrainer:
 
                     loss = loss.mean(dim=(1,2,3))
 
+                    if args.autostats_dynamic_timestep_weighting:
+                        for i in range(loss.shape[0]):
+                            timestep_probs[timesteps[i]] /= 1+loss[i].item()
+                            timestep_probs = autostats.smooth(timestep_probs)
+
                     loss_weights = batch["loss_weights"]  # 各sampleごとのweight
                     loss = loss * loss_weights
 
@@ -994,21 +1006,6 @@ class NetworkTrainer:
                         loss = add_v_prediction_like_loss(loss, timesteps, noise_scheduler, args.v_pred_like_loss)
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
-
-                    # masked_noise_pred = F.relu(noise_pred) + F.relu(-noise_pred)
-                    # masked_noise_pred = masked_noise_pred * (masked_noise_pred > 3).int() - torch.ones_like(masked_noise_pred) * 3 * (masked_noise_pred > 3).int()
-                    # masked_noise_true = F.relu(noise) + F.relu(-noise)
-                    # masked_noise_true = masked_noise_true * (masked_noise_true > 3).int() - torch.ones_like(masked_noise_true) * 3 * (masked_noise_true > 3).int()
-
-                    # step_logs["metrics/oob_pixels_1"]        = (noise_pred[noise_pred.abs() > 1].abs() - 1).sum() / (noise[noise.abs() > 1].abs() - 1).sum() / noise_pred.size(0)
-                    # step_logs["metrics/oob_pixels_2"]        = (noise_pred[noise_pred.abs() > 2].abs() - 2).sum() / (noise[noise.abs() > 2].abs() - 2).sum() / noise_pred.size(0)
-                    # step_logs["metrics/oob_pixels_3"]        = (noise_pred[noise_pred.abs() > 3].abs() - 3).sum() / (noise[noise.abs() > 3].abs() - 3).sum() / noise_pred.size(0)
-
-                    # step_logs["metrics/noise_pred_mean"]     = noise_pred.mean()
-                    # step_logs["metrics/noise_pred_std"]      = (pred_std.mean()).item()
-                    # step_logs["metrics/std_divergence"]      = (true_std.mean() - pred_std.mean()).item()
-                    # step_logs["metrics/skew_divergence"]     = (true_skews.mean() - pred_skews.mean()).item()
-                    # step_logs["metrics/kurtosis_divergence"] = (true_kurtoses.mean() - pred_kurtoses.mean()).item()
 
                     loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
 
