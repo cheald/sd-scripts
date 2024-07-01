@@ -2037,9 +2037,9 @@ class ControlNetDataset(BaseDataset):
         assert (
             len(missing_imgs) == 0
         ), f"missing conditioning data for {len(missing_imgs)} images / 制御用画像が見つかりませんでした: {missing_imgs}"
-        assert (
-            len(extra_imgs) == 0
-        ), f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}"
+        # assert (
+        #     len(extra_imgs) == 0
+        # ), f"extra conditioning data for {len(extra_imgs)} images / 余分な制御用画像があります: {extra_imgs}"
 
         self.conditioning_image_transforms = IMAGE_TRANSFORMS
 
