@@ -85,6 +85,8 @@ class DreamBoothSubsetParams(BaseSubsetParams):
     is_reg: bool = False
     class_tokens: Optional[str] = None
     caption_extension: str = ".caption"
+    positive_captions: Optional[List[str]] = None
+    negative_captions: Optional[List[str]] = None
     cache_info: bool = False
     alpha_mask: bool = False
 
@@ -99,6 +101,9 @@ class FineTuningSubsetParams(BaseSubsetParams):
 class ControlNetSubsetParams(BaseSubsetParams):
     conditioning_data_dir: str = None
     caption_extension: str = ".caption"
+    class_tokens: Optional[str] = None
+    positive_captions: Optional[List[str]] = None
+    negative_captions: Optional[List[str]] = None
     cache_info: bool = False
 
 
@@ -209,6 +214,8 @@ class ConfigSanitizer:
     # DB means DreamBooth
     DB_SUBSET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
+        "positive_captions": [str],
+        "negative_captions": [str],
         "class_tokens": str,
         "cache_info": bool,
     }
@@ -226,6 +233,9 @@ class ConfigSanitizer:
     CN_SUBSET_ASCENDABLE_SCHEMA = {
         "caption_extension": str,
         "cache_info": bool,
+        "positive_captions": [str],
+        "negative_captions": [str],
+        "class_tokens": str,
     }
     CN_SUBSET_DISTINCT_SCHEMA = {
         Required("image_dir"): str,
@@ -555,6 +565,8 @@ def generate_dataset_group_by_blueprint(dataset_group_blueprint: DatasetGroupBlu
           is_reg: {subset.is_reg}
           class_tokens: {subset.class_tokens}
           caption_extension: {subset.caption_extension}
+          positive_captions: {subset.positive_captions}
+          negative_captions: {subset.negative_captions}
         \n"""
                     ),
                     "    ",

@@ -7,12 +7,14 @@ import random
 import time
 import json
 from multiprocessing import Value
+import numpy as np
 import toml
 
 from tqdm import tqdm
 
 import torch
 from library.device_utils import init_ipex, clean_memory_on_device
+from library import embedding_weights
 
 init_ipex()
 
@@ -62,8 +64,9 @@ class NetworkTrainer:
         keys_scaled=None,
         mean_norm=None,
         maximum_norm=None,
+        extra={}
     ):
-        logs = {"loss/current": current_loss, "loss/average": avr_loss}
+        logs = {"loss/current": current_loss, "loss/average": avr_loss, **extra}
 
         if keys_scaled is not None:
             logs["max_norm/keys_scaled"] = keys_scaled
@@ -887,6 +890,16 @@ class NetworkTrainer:
                 accelerator.print(f"removing old checkpoint: {old_ckpt_file}")
                 os.remove(old_ckpt_file)
 
+        def embed_caption(captions):
+            return get_weighted_text_embeddings(
+                                tokenizer,
+                                text_encoder,
+                                captions,
+                                accelerator.device,
+                                args.max_token_length // 75 if args.max_token_length else 1,
+                                clip_skip=args.clip_skip,
+                            )
+
         # For --sample_at_first
         self.sample_images(accelerator, args, 0, global_step, accelerator.device, vae, tokenizer, text_encoder, unet)
 
@@ -896,6 +909,8 @@ class NetworkTrainer:
                 logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
                 initial_step -= len(train_dataloader)
             global_step = initial_step
+
+        embedding_manager = embedding_weights.EmbeddingLossManager(embed_caption, train_dataloader, args.pinned_terms)
 
         for epoch in range(epoch_to_start, num_train_epochs):
             accelerator.print(f"\nepoch {epoch+1}/{num_train_epochs}")
@@ -916,6 +931,7 @@ class NetworkTrainer:
                 if initial_step > 0:
                     initial_step -= 1
                     continue
+                step_logs = {}
 
                 with accelerator.accumulate(training_model):
                     on_step_start(text_encoder, unet)
@@ -947,14 +963,7 @@ class NetworkTrainer:
                     with torch.set_grad_enabled(train_text_encoder), accelerator.autocast():
                         # Get the text embedding for conditioning
                         if args.weighted_captions:
-                            text_encoder_conds = get_weighted_text_embeddings(
-                                tokenizer,
-                                text_encoder,
-                                batch["captions"],
-                                accelerator.device,
-                                args.max_token_length // 75 if args.max_token_length else 1,
-                                clip_skip=args.clip_skip,
-                            )
+                            embed_caption(batch["captions"])
                         else:
                             text_encoder_conds = self.get_text_cond(
                                 args, accelerator, batch, tokenizers, text_encoders, weight_dtype
@@ -965,6 +974,15 @@ class NetworkTrainer:
                     noise, noisy_latents, timesteps, huber_c = train_util.get_noise_noisy_latents_and_timesteps(
                         args, noise_scheduler, latents
                     )
+
+                    te_pos = embedding_manager.get_positive_loss(batch).mean()
+                    te_neg = embedding_manager.get_negative_loss(batch).mean()
+                    te_pin = embedding_manager.get_pinned_loss().mean()
+
+                    step_logs["loss/te_pos"] = te_pos.item()
+                    step_logs["loss/te_neg"] = te_neg.item()
+                    step_logs["loss/pinned_terms"] = te_pin.item()
+                    te_target = te_pos * 5e-2 + te_neg * 5e-2 + te_pin
 
                     # ensure the hidden state will require grad
                     if args.gradient_checkpointing:
@@ -1011,7 +1029,7 @@ class NetworkTrainer:
                     if args.debiased_estimation_loss:
                         loss = apply_debiased_estimation(loss, timesteps, noise_scheduler)
 
-                    loss = loss.mean()  # 平均なのでbatch_sizeで割る必要なし
+                    loss = loss.mean() + te_target  # 平均なのでbatch_sizeで割る必要なし
 
                     accelerator.backward(loss)
                     if accelerator.sync_gradients:
@@ -1067,7 +1085,7 @@ class NetworkTrainer:
 
                 if args.logging_dir is not None:
                     logs = self.generate_step_logs(
-                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, keys_scaled, mean_norm, maximum_norm
+                        args, current_loss, avr_loss, lr_scheduler, lr_descriptions, keys_scaled, mean_norm, maximum_norm, step_logs
                     )
                     accelerator.log(logs, step=global_step)
 

@@ -72,6 +72,7 @@ import library.huggingface_util as huggingface_util
 import library.sai_model_spec as sai_model_spec
 import library.deepspeed_utils as deepspeed_utils
 from library.utils import setup_logging
+from library import embedding_weights
 
 setup_logging()
 import logging
@@ -142,6 +143,8 @@ class ImageInfo:
         self.image_key: str = image_key
         self.num_repeats: int = num_repeats
         self.caption: str = caption
+        self.positive_captions: Optional[List[str]] = None
+        self.negative_captions: Optional[List[str]] = None
         self.is_reg: bool = is_reg
         self.absolute_path: str = absolute_path
         self.image_size: Tuple[int, int] = None
@@ -434,6 +437,8 @@ class DreamBoothSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        positive_captions: Optional[List[str]] = None,
+        negative_captions: Optional[List[str]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -462,6 +467,8 @@ class DreamBoothSubset(BaseSubset):
 
         self.is_reg = is_reg
         self.class_tokens = class_tokens
+        self.positive_captions = positive_captions
+        self.negative_captions = negative_captions
         self.caption_extension = caption_extension
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
@@ -556,6 +563,9 @@ class ControlNetSubset(BaseSubset):
         caption_suffix,
         token_warmup_min,
         token_warmup_step,
+        class_tokens: Optional[str],
+        positive_captions: Optional[List[str]] = None,
+        negative_captions: Optional[List[str]] = None,
     ) -> None:
         assert image_dir is not None, "image_dir must be specified / image_dirは指定が必須です"
 
@@ -584,6 +594,9 @@ class ControlNetSubset(BaseSubset):
 
         self.conditioning_data_dir = conditioning_data_dir
         self.caption_extension = caption_extension
+        self.class_tokens = class_tokens
+        self.positive_captions = positive_captions
+        self.negative_captions = negative_captions
         if self.caption_extension and not self.caption_extension.startswith("."):
             self.caption_extension = "." + self.caption_extension
         self.cache_info = cache_info
@@ -1193,6 +1206,8 @@ class BaseDataset(torch.utils.data.Dataset):
         text_encoder_outputs1_list = []
         text_encoder_outputs2_list = []
         text_encoder_pool2_list = []
+        positive_captions = []
+        negative_captions = []
 
         for image_key in bucket[image_index : image_index + bucket_batch_size]:
             image_info = self.image_data[image_key]
@@ -1289,6 +1304,8 @@ class BaseDataset(torch.utils.data.Dataset):
             images.append(image)
             latents_list.append(latents)
             alpha_mask_list.append(alpha_mask)
+            positive_captions.append(subset.positive_captions)
+            negative_captions.append(subset.negative_captions)
 
             target_size = (image.shape[2], image.shape[1]) if image is not None else (latents.shape[2] * 8, latents.shape[1] * 8)
 
@@ -1345,8 +1362,11 @@ class BaseDataset(torch.utils.data.Dataset):
                             token_caption2 = self.get_input_ids(caption, self.tokenizers[1])
                         input_ids2_list.append(token_caption2)
 
-        example = {}
-        example["loss_weights"] = torch.FloatTensor(loss_weights)
+        example = {
+            "positive_captions": positive_captions,
+            "negative_captions": negative_captions,
+            "loss_weights": torch.FloatTensor(loss_weights),
+        }
 
         if len(text_encoder_outputs1_list) == 0:
             if self.token_padding_disabled:
@@ -1976,6 +1996,8 @@ class ControlNetDataset(BaseDataset):
                 subset.caption_suffix,
                 subset.token_warmup_min,
                 subset.token_warmup_step,
+                subset.positive_captions,
+                subset.negative_captions,
             )
             db_subsets.append(db_subset)
 
@@ -3048,6 +3070,8 @@ def add_optimizer_arguments(parser: argparse.ArgumentParser):
 
 
 def add_training_arguments(parser: argparse.ArgumentParser, support_dreambooth: bool):
+    embedding_weights.add_arguments(parser)
+
     parser.add_argument(
         "--output_dir", type=str, default=None, help="directory to output trained model / 学習後のモデル出力先ディレクトリ"
     )
